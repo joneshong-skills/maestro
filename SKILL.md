@@ -8,7 +8,7 @@ description: >-
   "分配任務給不同模型", "多 CLI 協作",
   mentions multi-CLI orchestration, agent routing, parallel execution,
   CP-value dispatch, or multi-model workflows.
-version: 0.1.0
+version: 0.2.0
 tools: Read, Bash, Edit
 argument-hint: "<task description> [--pattern solo|pipeline|race|swarm|escalation]"
 ---
@@ -202,7 +202,7 @@ Options:
 - Race mode costs 2-3x more. Only use when quality justifies the cost.
 - Swarm requires the task to be genuinely decomposable. Do not force-split atomic tasks.
 - Escalation saves money but adds latency (multiple attempts).
-- All projects are team-tasks projects. Use `$TM status/log/graph` for detailed inspection.
+- All projects are stored as JSON in `~/.claude/data/maestro/`.
 - When the dispatcher is uncertain, it defaults to Solo with Claude Code (safest choice).
 
 ## Additional Resources

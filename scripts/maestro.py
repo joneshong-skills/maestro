@@ -33,8 +33,6 @@ SKILLS_DIR = Path.home() / ".claude" / "skills"
 DATA_DIR = Path(os.environ.get("MAESTRO_DIR", Path.home() / ".claude" / "data" / "maestro"))
 LOG_DIR = Path.home() / ".claude" / "logs" / "headless"
 
-TM = str(SKILLS_DIR / "team-tasks" / "scripts" / "task_manager.py")
-
 HEADLESS = {
     "claude": str(SKILLS_DIR / "claude-code-headless" / "scripts" / "claude_headless.py"),
     "codex": str(SKILLS_DIR / "codex-headless" / "scripts" / "codex_headless.py"),
@@ -58,17 +56,28 @@ CLI_ROUTING: dict[str, dict[str, str]] = {
 }
 
 CATEGORY_KEYWORDS: dict[str, list[str]] = {
-    "code_generation":  ["build", "create", "implement", "write", "add feature", "new feature", "generate"],
-    "code_review":      ["review", "check", "audit", "inspect", "PR", "pull request", "code review"],
-    "debugging":        ["fix", "bug", "error", "broken", "not working", "crash", "issue", "debug"],
-    "refactoring":      ["refactor", "clean up", "restructure", "optimize", "reorganize", "simplify"],
-    "architecture":     ["design", "plan", "architect", "system design", "architecture", "blueprint"],
-    "testing":          ["test", "spec", "coverage", "TDD", "unit test", "integration test", "e2e"],
-    "long_doc_analysis":["analyze", "summarize", "read", "document", "pdf", "report", "100 page"],
-    "frontend":         ["UI", "component", "React", "CSS", "layout", "frontend", "page", "form"],
-    "backend":          ["API", "server", "database", "endpoint", "backend", "REST", "GraphQL"],
-    "security":         ["vulnerability", "XSS", "SQL injection", "auth", "security", "penetration"],
-    "research":         ["research", "compare", "investigate", "explore", "survey", "benchmark"],
+    "code_generation":  ["build", "create", "implement", "write", "add feature", "new feature", "generate",
+                         "建立", "建置", "實作", "寫", "開發", "產生", "新增"],
+    "code_review":      ["review", "check", "audit", "inspect", "PR", "pull request", "code review",
+                         "審查", "檢查", "看一下", "review"],
+    "debugging":        ["fix", "bug", "error", "broken", "not working", "crash", "issue", "debug",
+                         "修", "修復", "修正", "錯誤", "壞了", "問題", "除錯"],
+    "refactoring":      ["refactor", "clean up", "restructure", "optimize", "reorganize", "simplify",
+                         "重構", "整理", "優化", "簡化", "重新架構"],
+    "architecture":     ["design", "plan", "architect", "system design", "architecture", "blueprint",
+                         "設計", "規劃", "架構"],
+    "testing":          ["test", "spec", "coverage", "TDD", "unit test", "integration test", "e2e",
+                         "測試", "測試覆蓋", "單元測試", "整合測試"],
+    "long_doc_analysis":["analyze", "summarize", "document", "pdf", "report", "100 page",
+                         "分析", "摘要", "總結", "文件", "報告"],
+    "frontend":         ["UI", "component", "React", "CSS", "layout", "frontend", "page", "form",
+                         "前端", "介面", "元件", "頁面", "表單"],
+    "backend":          ["API", "server", "database", "endpoint", "backend", "REST", "GraphQL",
+                         "後端", "伺服器", "資料庫"],
+    "security":         ["vulnerability", "XSS", "SQL injection", "auth", "security", "penetration",
+                         "安全", "漏洞", "認證", "授權"],
+    "research":         ["research", "compare", "investigate", "explore", "survey", "benchmark",
+                         "研究", "比較", "調查", "探索"],
 }
 
 # ── Default Pipeline Templates ─────────────────────────────────────
@@ -136,23 +145,45 @@ class MaestroProject:
 
 # ── Analysis ───────────────────────────────────────────────────────
 
+def _is_cjk(text: str) -> bool:
+    """Check if text contains CJK characters (Chinese/Japanese/Korean)."""
+    return bool(re.search(r'[\u4e00-\u9fff\u3400-\u4dbf]', text))
+
+
+def _word_match(pattern: str, text: str) -> bool:
+    """Match a keyword: word-boundary for Latin, substring for CJK."""
+    if _is_cjk(pattern):
+        return pattern in text
+    return bool(re.search(r'\b' + re.escape(pattern) + r'\b', text, re.IGNORECASE))
+
+
+def _effective_word_count(description: str) -> int:
+    """Word count with CJK fallback — Chinese chars ÷ 2 as rough word equivalent."""
+    words = len(description.split())
+    cjk_chars = len(re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', description))
+    if cjk_chars > 5:
+        words += cjk_chars // 2
+    return words
+
+
 def analyze_task(description: str, budget: str = "balanced") -> TaskAnalysis:
     """Classify a task description into categories, complexity, and pattern."""
     desc_lower = description.lower()
     analysis = TaskAnalysis(description=description)
 
-    # Identify categories
+    # Identify categories (word-boundary matching)
     scores: dict[str, int] = {}
     for cat, keywords in CATEGORY_KEYWORDS.items():
-        score = sum(1 for kw in keywords if kw.lower() in desc_lower)
+        score = sum(1 for kw in keywords if _word_match(kw, desc_lower))
         if score > 0:
             scores[cat] = score
     analysis.categories = sorted(scores, key=scores.get, reverse=True) if scores else ["code_generation"]
 
-    # Assess complexity
-    word_count = len(description.split())
-    multi_signals = sum(1 for w in ["and", "then", "also", "plus", "with", "including"]
-                        if w in desc_lower)
+    # Assess complexity (with CJK fallback)
+    word_count = _effective_word_count(description)
+    multi_signals = sum(1 for w in ["and", "then", "also", "plus", "with", "including",
+                                     "並且", "然後", "還有", "以及", "同時"]
+                        if _word_match(w, desc_lower))
     if word_count > 50 or multi_signals >= 3:
         analysis.complexity = "complex"
     elif word_count > 20 or multi_signals >= 1:
@@ -160,11 +191,10 @@ def analyze_task(description: str, budget: str = "balanced") -> TaskAnalysis:
     else:
         analysis.complexity = "simple"
 
-    # Check decomposability
-    seq_signals = any(p in desc_lower for p in [
+    # Check decomposability (word-boundary for English, substring for CJK particles)
+    seq_signals = any(_word_match(p, desc_lower) for p in [
         "first", "then", "after that", "finally", "step 1", "phase",
-        "先", "然後", "接著", "最後",
-    ])
+    ]) or any(p in desc_lower for p in ["先", "然後", "接著", "最後"])
     par_signals = desc_lower.count(" and ") >= 2 or desc_lower.count("、") >= 2
 
     if seq_signals:
@@ -319,7 +349,12 @@ def dispatch_agent(cli: str, prompt: str, cwd: str | None = None,
             # Try to extract result from JSON output (claude)
             if cli == "claude" and output:
                 try:
-                    data = json.loads(output)
+                    # Strip control chars (^D etc.) that headless scripts may prepend
+                    clean = output.lstrip('\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0b\x0c\x0e\x0f')
+                    json_start = clean.find('{')
+                    if json_start >= 0:
+                        clean = clean[json_start:]
+                    data = json.loads(clean)
                     output = data.get("result", output)
                 except (json.JSONDecodeError, TypeError):
                     pass
