@@ -61,7 +61,7 @@ CATEGORY_KEYWORDS: dict[str, list[str]] = {
     "code_review":      ["review", "check", "audit", "inspect", "PR", "pull request", "code review",
                          "審查", "檢查", "看一下", "review"],
     "debugging":        ["fix", "bug", "error", "broken", "not working", "crash", "issue", "debug",
-                         "修", "修復", "修正", "錯誤", "壞了", "問題", "除錯"],
+                         "修", "修復", "修正", "錯誤", "壞了", "除錯"],
     "refactoring":      ["refactor", "clean up", "restructure", "optimize", "reorganize", "simplify",
                          "重構", "整理", "優化", "簡化", "重新架構"],
     "architecture":     ["design", "plan", "architect", "system design", "architecture", "blueprint",
@@ -79,6 +79,36 @@ CATEGORY_KEYWORDS: dict[str, list[str]] = {
     "research":         ["research", "compare", "investigate", "explore", "survey", "benchmark",
                          "研究", "比較", "調查", "探索"],
 }
+
+# ── Explicit CLI Name Aliases ─────────────────────────────────────
+# Maps user-facing names to canonical CLI keys.
+CLI_NAME_ALIASES: dict[str, str] = {
+    "claude": "claude", "claude code": "claude", "claude-code": "claude",
+    "codex": "codex", "codex cli": "codex", "codex-cli": "codex",
+    "openai codex": "codex", "openai": "codex",
+    "gemini": "gemini", "gemini cli": "gemini", "gemini-cli": "gemini",
+    "google gemini": "gemini",
+}
+
+
+def detect_explicit_clis(description: str) -> list[str]:
+    """Detect CLI names explicitly mentioned by the user.
+
+    Returns a deduplicated list of canonical CLI keys in the order they appear.
+    Longer aliases are checked first to avoid partial matches (e.g., "claude code"
+    before "claude").
+    """
+    desc_lower = description.lower()
+    found: dict[str, int] = {}   # canonical name → first position
+    # Sort aliases longest-first so "claude code" matches before "claude"
+    for alias in sorted(CLI_NAME_ALIASES, key=len, reverse=True):
+        pos = desc_lower.find(alias)
+        if pos >= 0:
+            canon = CLI_NAME_ALIASES[alias]
+            if canon not in found:
+                found[canon] = pos
+    # Return in order of appearance
+    return [cli for cli, _ in sorted(found.items(), key=lambda x: x[1])]
 
 # ── Default Pipeline Templates ─────────────────────────────────────
 
@@ -181,9 +211,15 @@ def analyze_task(description: str, budget: str = "balanced") -> TaskAnalysis:
 
     # Assess complexity (with CJK fallback)
     word_count = _effective_word_count(description)
-    multi_signals = sum(1 for w in ["and", "then", "also", "plus", "with", "including",
-                                     "並且", "然後", "還有", "以及", "同時"]
-                        if _word_match(w, desc_lower))
+    # Count total occurrences of coordination signals (not just distinct keywords)
+    multi_signal_words = ["and", "then", "also", "plus", "with", "including",
+                          "並且", "然後", "還有", "以及", "同時"]
+    multi_signals = 0
+    for w in multi_signal_words:
+        if _is_cjk(w):
+            multi_signals += desc_lower.count(w)
+        else:
+            multi_signals += len(re.findall(r'\b' + re.escape(w) + r'\b', desc_lower, re.IGNORECASE))
     if word_count > 50 or multi_signals >= 3:
         analysis.complexity = "complex"
     elif word_count > 20 or multi_signals >= 1:
@@ -319,10 +355,34 @@ def build_cli_cmd(cli: str, prompt: str, cwd: str | None, background: bool) -> l
 
 
 def dispatch_agent(cli: str, prompt: str, cwd: str | None = None,
-                   background: bool = False, timeout: int = 300) -> AgentResult:
+                   background: bool = False, timeout: int = 300,
+                   skip_preflight: bool = False) -> AgentResult:
     """Launch a CLI agent and collect the result."""
-    cmd = build_cli_cmd(cli, prompt, cwd, background)
     task_id = f"{cli}-{int(time.time())}"
+
+    # Pre-flight resource check
+    if not skip_preflight:
+        _shared = str(SKILLS_DIR / "_shared")
+        if Path(_shared).is_dir():
+            sys.path.insert(0, _shared)
+            try:
+                from preflight import run_preflight, Verdict, format_result
+                pf = run_preflight()
+                if pf.verdict == Verdict.BLOCK:
+                    return AgentResult(
+                        task_id=task_id, cli=cli, status="blocked",
+                        duration_s=0,
+                        output=f"Pre-flight BLOCKED:\n{format_result(pf)}",
+                    )
+                elif pf.verdict == Verdict.WARN:
+                    print(format_result(pf), file=sys.stderr)
+            except ImportError:
+                pass
+            finally:
+                if _shared in sys.path:
+                    sys.path.remove(_shared)
+
+    cmd = build_cli_cmd(cli, prompt, cwd, background)
     start = time.time()
 
     try:
@@ -349,8 +409,9 @@ def dispatch_agent(cli: str, prompt: str, cwd: str | None = None,
             # Try to extract result from JSON output (claude)
             if cli == "claude" and output:
                 try:
-                    # Strip control chars (^D etc.) that headless scripts may prepend
-                    clean = output.lstrip('\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0b\x0c\x0e\x0f')
+                    # Strip ANSI escape codes (color, cursor, etc.) and control chars
+                    clean = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', output)
+                    clean = clean.lstrip('\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0b\x0c\x0e\x0f')
                     json_start = clean.find('{')
                     if json_start >= 0:
                         clean = clean[json_start:]
@@ -395,23 +456,27 @@ def wait_for_background(pid: str, log_path: str, timeout: int = 300) -> str:
 
 # ── Pattern Executors ──────────────────────────────────────────────
 
-def execute_solo(project: MaestroProject, timeout: int) -> MaestroProject:
+def execute_solo(project: MaestroProject, timeout: int,
+                 skip_preflight: bool = False) -> MaestroProject:
     """Single agent, single task."""
     analysis = analyze_task(project.task, project.budget)
-    cli = route_to_cli(analysis.categories[0], project.budget)
+    explicit_clis = detect_explicit_clis(project.task)
+    cli = explicit_clis[0] if explicit_clis else route_to_cli(analysis.categories[0], project.budget)
     project.phases = [{"id": "main", "cli": cli, "role": "Execute the task"}]
 
     print(f"[maestro] Pattern: Solo ({cli})")
     print(f"[1/1] {cli.title()}... dispatching")
 
-    result = dispatch_agent(cli, project.task, project.cwd, timeout=timeout)
+    result = dispatch_agent(cli, project.task, project.cwd, timeout=timeout,
+                            skip_preflight=skip_preflight)
     project.results = [asdict(result)]
 
     print(f"[1/1] {cli.title()}... {result.status} ({result.duration_s}s)")
     return project
 
 
-def execute_pipeline(project: MaestroProject, timeout: int) -> MaestroProject:
+def execute_pipeline(project: MaestroProject, timeout: int,
+                     skip_preflight: bool = False) -> MaestroProject:
     """Sequential phases, each building on the previous."""
     analysis = analyze_task(project.task, project.budget)
     phases = analysis.phases or PIPELINE_TEMPLATES["code_generation"]
@@ -431,7 +496,8 @@ def execute_pipeline(project: MaestroProject, timeout: int) -> MaestroProject:
             prompt += f"\n\nContext from previous phase:\n{prev_result[:3000]}"
 
         print(f"[{i}/{total}] {role} ({cli.title()})... dispatching")
-        result = dispatch_agent(cli, prompt, project.cwd, timeout=timeout)
+        result = dispatch_agent(cli, prompt, project.cwd, timeout=timeout,
+                                skip_preflight=skip_preflight)
         project.results.append(asdict(result))
         prev_result = result.output
 
@@ -444,9 +510,11 @@ def execute_pipeline(project: MaestroProject, timeout: int) -> MaestroProject:
     return project
 
 
-def execute_race(project: MaestroProject, timeout: int) -> MaestroProject:
+def execute_race(project: MaestroProject, timeout: int,
+                 skip_preflight: bool = False) -> MaestroProject:
     """Same task to multiple CLIs in parallel, compare results."""
-    clis = ["claude", "codex", "gemini"]
+    explicit_clis = detect_explicit_clis(project.task)
+    clis = explicit_clis if len(explicit_clis) >= 2 else ["claude", "codex", "gemini"]
     project.phases = [{"id": cli, "cli": cli, "role": f"Race participant ({cli})"} for cli in clis]
     total = len(clis)
 
@@ -456,7 +524,8 @@ def execute_race(project: MaestroProject, timeout: int) -> MaestroProject:
     bg_info: list[tuple[str, str | None, str | None]] = []
     for cli in clis:
         print(f"  Launching {cli.title()}...")
-        result = dispatch_agent(cli, project.task, project.cwd, background=True)
+        result = dispatch_agent(cli, project.task, project.cwd, background=True,
+                                skip_preflight=skip_preflight)
         info = json.loads(result.output) if result.output else {}
         bg_info.append((cli, info.get("pid"), info.get("log")))
 
@@ -484,7 +553,8 @@ def execute_race(project: MaestroProject, timeout: int) -> MaestroProject:
 
 
 def execute_swarm(project: MaestroProject, timeout: int,
-                  ratio: str | None = None) -> MaestroProject:
+                  ratio: str | None = None,
+                  skip_preflight: bool = False) -> MaestroProject:
     """Distribute subtasks across CLIs by category or ratio."""
     analysis = analyze_task(project.task, project.budget)
 
@@ -523,7 +593,8 @@ def execute_swarm(project: MaestroProject, timeout: int,
         cli = phase["cli"]
         prompt = f"Task: {project.task}\n\nFocus on: {phase['role']}"
         print(f"  Launching {phase['id']} ({cli})...")
-        result = dispatch_agent(cli, prompt, project.cwd, background=True)
+        result = dispatch_agent(cli, prompt, project.cwd, background=True,
+                                skip_preflight=skip_preflight)
         info = json.loads(result.output) if result.output else {}
         bg_info.append((phase, info.get("pid"), info.get("log")))
 
@@ -544,7 +615,8 @@ def execute_swarm(project: MaestroProject, timeout: int,
     return project
 
 
-def execute_escalation(project: MaestroProject, timeout: int) -> MaestroProject:
+def execute_escalation(project: MaestroProject, timeout: int,
+                       skip_preflight: bool = False) -> MaestroProject:
     """Start cheap, escalate on failure or low quality."""
     chain = ["gemini", "codex", "claude"]  # cheapest → most expensive
     project.phases = [{"id": f"attempt-{cli}", "cli": cli, "role": f"Attempt ({cli})"} for cli in chain]
@@ -553,7 +625,8 @@ def execute_escalation(project: MaestroProject, timeout: int) -> MaestroProject:
 
     for i, cli in enumerate(chain, 1):
         print(f"[{i}/{len(chain)}] Trying {cli.title()}...")
-        result = dispatch_agent(cli, project.task, project.cwd, timeout=timeout)
+        result = dispatch_agent(cli, project.task, project.cwd, timeout=timeout,
+                                skip_preflight=skip_preflight)
         project.results.append(asdict(result))
 
         if result.status == "done" and quality_check(result.output):
@@ -658,16 +731,17 @@ def cmd_run(args):
     start = time.time()
 
     # Execute pattern
+    sp = getattr(args, 'skip_preflight', False)
     executors = {
         "solo": execute_solo,
         "pipeline": execute_pipeline,
         "race": execute_race,
-        "swarm": lambda p, t: execute_swarm(p, t, args.ratio),
+        "swarm": lambda p, t, s: execute_swarm(p, t, args.ratio, s),
         "escalation": execute_escalation,
     }
 
     executor = executors.get(project.pattern, execute_solo)
-    project = executor(project, args.timeout)
+    project = executor(project, args.timeout, sp)
 
     project.total_duration_s = round(time.time() - start, 1)
     project.completed_at = datetime.now().isoformat()
@@ -691,6 +765,19 @@ def cmd_plan(args):
     analysis = analyze_task(task, args.budget)
     pattern = args.pattern or analysis.recommended_pattern
 
+    # Sync analysis dataclass with the effective pattern so JSON output is consistent
+    if args.pattern and args.pattern != analysis.recommended_pattern:
+        analysis.recommended_pattern = args.pattern
+        # Rebuild phases if pattern was overridden to pipeline
+        if args.pattern == "pipeline":
+            primary_cat = analysis.categories[0]
+            analysis.phases = PIPELINE_TEMPLATES.get(primary_cat, PIPELINE_TEMPLATES["code_generation"])
+        elif args.pattern != "pipeline":
+            analysis.phases = []
+
+    # Detect explicitly mentioned CLIs
+    explicit_clis = detect_explicit_clis(task)
+
     print(f"=== Maestro Plan (dry-run) ===")
     print(f"Task: {task}")
     print(f"Complexity: {analysis.complexity}")
@@ -698,10 +785,15 @@ def cmd_plan(args):
     print(f"Categories: {', '.join(analysis.categories)}")
     print(f"Recommended pattern: {pattern}")
     print(f"Budget: {args.budget}")
+    if explicit_clis:
+        print(f"Explicit CLIs detected: {', '.join(c.title() for c in explicit_clis)}")
     print()
 
     if pattern == "solo":
-        cli = route_to_cli(analysis.categories[0], args.budget)
+        if explicit_clis:
+            cli = explicit_clis[0]
+        else:
+            cli = route_to_cli(analysis.categories[0], args.budget)
         print(f"Will dispatch to: {cli.title()}")
 
     elif pattern == "pipeline":
@@ -713,7 +805,10 @@ def cmd_plan(args):
             print(f"  {i}. [{p['cli'].title()}] {p['role']}")
 
     elif pattern == "race":
-        print("Race participants: Claude, Codex, Gemini (all 3 in parallel)")
+        if explicit_clis and len(explicit_clis) >= 2:
+            print(f"Race participants: {', '.join(c.title() for c in explicit_clis)}")
+        else:
+            print("Race participants: Claude, Codex, Gemini (all 3 in parallel)")
 
     elif pattern == "swarm":
         if args.ratio:
@@ -733,7 +828,10 @@ def cmd_plan(args):
         print("Escalation chain: Gemini → Codex → Claude (cheapest first)")
 
     if args.json:
-        print(json.dumps(asdict(analysis), indent=2, ensure_ascii=False))
+        plan_data = asdict(analysis)
+        if explicit_clis:
+            plan_data["explicit_clis"] = explicit_clis
+        print(json.dumps(plan_data, indent=2, ensure_ascii=False))
 
 
 def cmd_status(args):
@@ -795,6 +893,8 @@ def main():
     p_run.add_argument("--project", help="Custom project name")
     p_run.add_argument("--notify", action="store_true")
     p_run.add_argument("--json", action="store_true")
+    p_run.add_argument("--skip-preflight", action="store_true",
+                       help="Skip resource pre-flight checks (memory/context)")
 
     # ── plan ──
     p_plan = sub.add_parser("plan", help="Analyze task (dry-run)")
