@@ -39,6 +39,8 @@ HEADLESS = {
     "gemini": str(SKILLS_DIR / "gemini-cli-headless" / "scripts" / "gemini_headless.py"),
 }
 
+FOREMAN = str(SKILLS_DIR / "foreman" / "scripts" / "foreman.py")
+
 # ── CLI Routing Table ──────────────────────────────────────────────
 
 CLI_ROUTING: dict[str, dict[str, str]] = {
@@ -54,6 +56,26 @@ CLI_ROUTING: dict[str, dict[str, str]] = {
     "security":         {"primary": "claude", "budget": "claude", "power": "claude"},
     "research":         {"primary": "gemini", "budget": "gemini", "power": "gemini"},
 }
+
+# ── Agent Routing (foreman integration) ────────────────────────────
+# Maps task categories to preferred sub-agent names.
+# If a matching agent exists, maestro can delegate via agent_dispatch
+# instead of spinning up a full CLI process.
+
+AGENT_ROUTING: dict[str, str | None] = {
+    "code_generation":   None,                # needs full CLI (write access, sandbox)
+    "code_review":       "code-reviewer",     # read-only, fast
+    "debugging":         None,                # needs full context + write
+    "refactoring":       None,                # needs write access
+    "architecture":      None,                # needs deep reasoning (CLI)
+    "testing":           None,                # needs execution environment
+    "long_doc_analysis": None,                # needs 1M context (Gemini)
+    "frontend":          None,                # needs write access
+    "backend":           None,                # needs write access
+    "security":          "security-scanner",  # read-only audit
+    "research":          None,                # needs web access (CLI)
+}
+
 
 CATEGORY_KEYWORDS: dict[str, list[str]] = {
     "code_generation":  ["build", "create", "implement", "write", "add feature", "new feature", "generate",
@@ -246,6 +268,87 @@ def route_to_cli(category: str, budget: str = "balanced") -> str:
     routing = CLI_ROUTING.get(category, CLI_ROUTING["code_generation"])
     return routing.get(tier, "claude")
 
+
+def check_agent_match(task: str, category: str, threshold: float = 0.15) -> str | None:
+    """Check if a sub-agent can handle this task via foreman.
+
+    Returns the agent name if a good match exists, None otherwise.
+    """
+    # First check static routing table
+    preferred = AGENT_ROUTING.get(category)
+
+    # Then ask foreman for a dynamic match
+    try:
+        result = subprocess.run(
+            [sys.executable, FOREMAN, "match", task, "--json"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            matches = json.loads(result.stdout)
+            if matches and matches[0]["score"] >= threshold:
+                best = matches[0]
+                # If static routing agrees or no static preference, use foreman's pick
+                if preferred and best["name"] == preferred:
+                    return best["name"]
+                if not preferred and best["score"] >= 0.3:
+                    return best["name"]
+                if preferred:
+                    return preferred  # trust static routing
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception):
+        pass
+
+    return preferred  # fallback to static routing (may be None)
+
+
+def dispatch_via_agent(agent_name: str, task: str, cwd: str | None = None,
+                       timeout: int = 300) -> AgentResult:
+    """Dispatch a task to a sub-agent via claude -p with agent instruction.
+
+    Uses Claude Code headless to invoke the sub-agent, which is lighter
+    than a full CLI dispatch since the agent constrains model/tools.
+    """
+    prompt = f'Use the {agent_name} agent to: {task}'
+    task_id = f"agent-{agent_name}-{int(time.time())}"
+    start = time.time()
+
+    try:
+        cmd = [sys.executable, HEADLESS["claude"], "-p", prompt,
+               "--output-format", "json"]
+        if cwd:
+            cmd += ["--cwd", cwd]
+
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        elapsed = time.time() - start
+        output = proc.stdout.strip()
+
+        # Try to extract result from JSON
+        if output:
+            try:
+                json_start = output.find('{')
+                if json_start >= 0:
+                    data = json.loads(output[json_start:])
+                    output = data.get("result", output)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        return AgentResult(
+            task_id=task_id, cli=f"agent:{agent_name}",
+            status="done" if proc.returncode == 0 else "failed",
+            duration_s=round(elapsed, 1), output=output[:5000],
+        )
+    except subprocess.TimeoutExpired:
+        return AgentResult(
+            task_id=task_id, cli=f"agent:{agent_name}",
+            status="timeout", duration_s=timeout,
+            output="Agent timed out",
+        )
+    except Exception as e:
+        return AgentResult(
+            task_id=task_id, cli=f"agent:{agent_name}",
+            status="failed", duration_s=round(time.time() - start, 1),
+            output=f"Agent dispatch error: {e}",
+        )
+
 # ── Project Management ─────────────────────────────────────────────
 
 def generate_project_name() -> str:
@@ -396,9 +499,24 @@ def wait_for_background(pid: str, log_path: str, timeout: int = 300) -> str:
 # ── Pattern Executors ──────────────────────────────────────────────
 
 def execute_solo(project: MaestroProject, timeout: int) -> MaestroProject:
-    """Single agent, single task."""
+    """Single agent, single task. Prefers sub-agent when available."""
     analysis = analyze_task(project.task, project.budget)
-    cli = route_to_cli(analysis.categories[0], project.budget)
+    category = analysis.categories[0]
+
+    # Check if a sub-agent can handle this (faster + cheaper)
+    agent_name = check_agent_match(project.task, category)
+    if agent_name:
+        project.phases = [{"id": "main", "cli": f"agent:{agent_name}", "role": "Execute via sub-agent"}]
+        print(f"[maestro] Pattern: Solo (agent:{agent_name}) — delegating to foreman")
+        print(f"[1/1] Agent {agent_name}... dispatching")
+
+        result = dispatch_via_agent(agent_name, project.task, project.cwd, timeout=timeout)
+        project.results = [asdict(result)]
+        print(f"[1/1] Agent {agent_name}... {result.status} ({result.duration_s}s)")
+        return project
+
+    # Fallback to CLI dispatch
+    cli = route_to_cli(category, project.budget)
     project.phases = [{"id": "main", "cli": cli, "role": "Execute the task"}]
 
     print(f"[maestro] Pattern: Solo ({cli})")
@@ -701,8 +819,14 @@ def cmd_plan(args):
     print()
 
     if pattern == "solo":
-        cli = route_to_cli(analysis.categories[0], args.budget)
-        print(f"Will dispatch to: {cli.title()}")
+        category = analysis.categories[0]
+        agent_name = check_agent_match(task, category)
+        if agent_name:
+            print(f"Will dispatch to: agent:{agent_name} (via foreman)")
+            print(f"  Fallback CLI: {route_to_cli(category, args.budget).title()}")
+        else:
+            cli = route_to_cli(category, args.budget)
+            print(f"Will dispatch to: {cli.title()} (no matching agent)")
 
     elif pattern == "pipeline":
         phases = analysis.phases or PIPELINE_TEMPLATES.get(
