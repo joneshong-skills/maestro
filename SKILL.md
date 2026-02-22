@@ -16,15 +16,34 @@ argument-hint: "<task description> [--pattern solo|pipeline|race|swarm|escalatio
 # Maestro
 
 Intelligent conductor that routes tasks to the right CLI tool(s) based on CP value.
-Composes model-mentor (routing), team-tasks (coordination), and three headless CLI skills
-(claude-code-headless, codex-headless, gemini-cli-headless) into unified workflows.
+Composes model-mentor (routing), team-tasks (coordination), and CLI execution skills into
+unified workflows.
+
+**Two execution modes:**
+
+| Mode | Skills Used | Best For |
+|------|------------|----------|
+| **Headless** (default) | claude-code-headless, codex-cli-headless, gemini-cli-headless | Single-shot tasks, batch processing, cost-efficient |
+| **Interactive** | claude-code-interactive, codex-cli-interactive, gemini-cli-interactive | Multi-turn tasks, context-dependent chains, iterative refinement |
+
+Choose interactive when a task requires **continuous context** across multiple exchanges
+(e.g., iterative debugging, design exploration, complex refactoring with feedback loops).
+
+**Memory warning**: Interactive sessions accumulate context in tmux. For long-running tasks,
+monitor context usage — if an agent approaches its limit, switch to headless for remaining
+subtasks or start a fresh interactive session with a summary of prior work.
 
 ## Core Principle
 
-**Intelligence layer** (this SKILL.md, read by Claude Code) decides WHAT to do.
-**Mechanics layer** (`scripts/maestro.py`) handles HOW to execute it.
+**Intelligence layer** (this SKILL.md, read by Claude Code Opus) decides WHAT to do.
+**Dispatch layer** (codex-dispatcher / gemini-dispatcher agents) handles HOW to execute externally.
+**Mechanics layer** (`scripts/maestro.py`) handles process orchestration.
 
-The intelligence layer is flexible and principle-based. The mechanics layer is deterministic.
+The three-tier design protects Opus context from CLI dispatch mechanics:
+- Opus: task analysis, routing decisions, result synthesis (~200 tokens)
+- Sonnet dispatcher agents: CLI command formatting, execution, summarization (~6500 tokens at Sonnet price)
+- Codex/Gemini CLIs: actual task execution (separate subscription quota)
+
 When in doubt, lean toward simpler patterns. Solo covers 70% of tasks.
 
 ## Quick Start
@@ -134,17 +153,86 @@ Use this routing table (derived from model-mentor's cli-comparison):
 - `--budget balanced` (default) → use Primary CLI column
 - `--budget maximize_quality` → use Power CLI column
 
-### Step 4: Execute
+### Step 3.5: Dispatch via Agents (Preferred)
 
-Run the dispatcher:
+When routing to Codex or Gemini, prefer **dispatcher agents** over direct CLI execution.
+This offloads CLI mechanics from Opus to cheaper Sonnet sub-agents:
 
+| Routed CLI | Dispatch Method | Agent |
+|-----------|----------------|-------|
+| **Claude Code** | Direct (self) or `claude -p` headless | — (stays in main context) |
+| **Codex CLI** | `Task(subagent_type: "codex-dispatcher")` | codex-dispatcher (Sonnet) |
+| **Gemini CLI** | `Task(subagent_type: "gemini-dispatcher")` | gemini-dispatcher (Sonnet) |
+
+**Single-CLI dispatcher prompt**:
+```
+Execute the following task using Codex/Gemini CLI:
+
+Task: {task description}
+Working directory: {cwd}
+Sandbox: {read-only | workspace-write | full-auto}
+Skills to use: {skill name, if applicable}
+Output to: {file path, if applicable}
+
+Return: status, summary, files modified, errors.
+```
+
+**Multi-CLI foreman prompt** (for Pipeline / multi-step tasks):
+```
+Task(subagent_type: "foreman", prompt: """
+Execute this multi-phase task:
+
+Phase 1 (Codex): {task A description}
+  Working directory: {cwd}
+Phase 2 (Gemini): {task B description, may use Phase 1 output}
+Phase 3 (Codex): {task C description}
+
+Pass results between phases via files. Return consolidated report.
+""")
+```
+
+**When to use which**:
+
+| Scenario | Dispatch Method | Why |
+|----------|----------------|-----|
+| Single CLI task | `codex-dispatcher` or `gemini-dispatcher` | Minimal overhead |
+| Multi-step, sequential phases | `foreman` | One sub-agent handles all coordination internally, Opus untouched |
+| Simple one-liner | Direct `scripts/maestro.py` | No agent overhead needed |
+| Independent parallel tasks | Multiple dispatchers in parallel | Each runs independently |
+
+**Key principle**: foreman is preferred for **Pipeline** and multi-step **Solo** patterns.
+It keeps ALL coordination in Sonnet's context (~400 tok Opus vs ~1200+ tok without it).
+
+### Step 4: Choose Execution Mode
+
+**Headless** (default) — single-shot, stateless:
 ```bash
 $MAESTRO run [--pattern PATTERN] [--budget BUDGET] [--cwd PATH] "task description"
 ```
 
+**Interactive** — multi-turn via tmux, context-preserving:
+```bash
+$MAESTRO run --interactive [--pattern PATTERN] [--budget BUDGET] [--cwd PATH] "task description"
+```
+
+| Decision Factor | → Headless | → Interactive |
+|----------------|-----------|---------------|
+| Task is self-contained | Yes | — |
+| Needs iterative feedback | — | Yes |
+| Pipeline phases are independent | Yes | — |
+| Pipeline phases build on conversation | — | Yes |
+| Budget-sensitive | Yes (cheaper) | — |
+| Quality-critical multi-turn | — | Yes |
+
+When `--interactive` is set:
+- Solo → launches a tmux interactive session with the routed CLI
+- Pipeline → each phase runs in an interactive session, passing context forward naturally
+- Race → each CLI gets its own interactive session in parallel
+- Swarm → each subtask in its own interactive session
+
 The script handles:
 - Creating a team-tasks project
-- Dispatching to appropriate headless CLI wrapper(s)
+- Dispatching to headless OR interactive CLI wrappers (based on `--interactive` flag)
 - Background execution for parallel patterns
 - Monitoring progress and collecting results
 - Generating a structured report
@@ -187,6 +275,7 @@ $MAESTRO report PROJECT             # Show final report
 
 Options:
   --pattern PATTERN                 # Force: solo|pipeline|race|swarm|escalation
+  --interactive                     # Use interactive (tmux) mode instead of headless
   --ratio RATIO                     # Swarm ratio: "3:1:1" (claude:codex:gemini)
   --cwd PATH                        # Working directory for agents
   --budget BUDGET                   # minimize|balanced|maximize_quality
@@ -204,6 +293,25 @@ Options:
 - Escalation saves money but adds latency (multiple attempts).
 - All projects are stored as JSON in `~/.claude/data/maestro/`.
 - When the dispatcher is uncertain, it defaults to Solo with Claude Code (safest choice).
+
+## Continuous Improvement
+
+This skill evolves with each use. After every invocation:
+
+1. **Reflect** — Identify what worked, what caused friction, and any unexpected issues
+2. **Record** — Append a concise lesson to `lessons.md` in this skill's directory
+3. **Refine** — When a pattern recurs (2+ times), update SKILL.md directly
+
+### lessons.md Entry Format
+
+```
+### YYYY-MM-DD — Brief title
+- **Friction**: What went wrong or was suboptimal
+- **Fix**: How it was resolved
+- **Rule**: Generalizable takeaway for future invocations
+```
+
+Accumulated lessons signal when to run `/skill-optimizer` for a deeper structural review.
 
 ## Additional Resources
 
