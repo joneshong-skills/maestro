@@ -8,7 +8,7 @@ description: >-
   "分配任務給不同模型", "多 CLI 協作",
   mentions multi-CLI orchestration, agent routing, parallel execution,
   CP-value dispatch, or multi-model workflows.
-version: 0.2.0
+version: 0.2.1
 tools: Read, Bash, Edit
 argument-hint: "<task description> [--pattern solo|pipeline|race|swarm|escalation]"
 ---
@@ -69,7 +69,7 @@ $MAESTRO report maestro-20260211-143022
 
 | Pattern | Agents | When to use |
 |---------|--------|-------------|
-| **Solo** | 1 | Simple, well-defined, single-scope tasks |
+| **Solo** | 1 | Simple, well-defined, single-scope tasks (may delegate to sub-agent via foreman) |
 | **Pipeline** | 2-5 seq | Multi-phase work (plan → implement → review) |
 | **Race** | 2-3 parallel | Quality-critical; compare outputs from multiple CLIs |
 | **Swarm** | 3+ parallel | Large task decomposable into independent subtasks |
@@ -134,19 +134,22 @@ Default → Solo (primary CLI from routing table)
 
 Use this routing table (derived from model-mentor's cli-comparison):
 
-| Task category | Primary CLI | Budget CLI | Power CLI |
-|---------------|------------|-----------|-----------|
-| code_generation | Claude Code | Gemini CLI | Claude Code |
-| code_review | Claude Code | Codex CLI | Claude Code |
-| debugging | Claude Code | Gemini CLI | Claude Code |
-| refactoring | Codex CLI | Codex CLI | Claude Code |
-| architecture | Claude Code | Claude Code | Claude Code |
-| testing | Codex CLI | Codex CLI | Claude Code |
-| long_doc_analysis | Gemini CLI | Gemini CLI | Gemini CLI |
-| frontend | Claude Code | Gemini CLI | Claude Code |
-| backend | Codex CLI | Codex CLI | Claude Code |
-| security | Claude Code | Claude Code | Claude Code |
-| research | Gemini CLI | Gemini CLI | Gemini CLI |
+| Task category | Primary CLI | Budget CLI | Power CLI | Sub-Agent |
+|---------------|------------|-----------|-----------|-----------|
+| code_generation | Claude Code | Gemini CLI | Claude Code | — |
+| code_review | Claude Code | Codex CLI | Claude Code | `code-reviewer` |
+| debugging | Claude Code | Gemini CLI | Claude Code | — |
+| refactoring | Codex CLI | Codex CLI | Claude Code | — |
+| architecture | Claude Code | Claude Code | Claude Code | — |
+| testing | Codex CLI | Codex CLI | Claude Code | — |
+| long_doc_analysis | Gemini CLI | Gemini CLI | Gemini CLI | — |
+| frontend | Claude Code | Gemini CLI | Claude Code | — |
+| backend | Codex CLI | Codex CLI | Claude Code | — |
+| security | Claude Code | Claude Code | Claude Code | `security-scanner` |
+| research | Gemini CLI | Gemini CLI | Gemini CLI | — |
+
+When a Sub-Agent is available for a category, Solo mode will **prefer the agent** over
+spinning up a full CLI process. This is faster and cheaper for read-only tasks.
 
 **Budget selection logic**:
 - `--budget minimize` → use Budget CLI column
@@ -284,9 +287,34 @@ Options:
   --json                            # Machine-readable JSON output
 ```
 
+## Foreman Integration (Sub-Agent Dispatch)
+
+Maestro integrates with the **foreman** skill to prefer lightweight sub-agents over full CLI
+processes when a matching agent exists.
+
+```
+Solo dispatch flow:
+  Task → check_agent_match() → agent found? → dispatch_via_agent() (fast, cheap)
+                              → no agent?   → dispatch_via_cli() (full CLI)
+```
+
+The routing uses a two-step check:
+1. **Static routing** (`AGENT_ROUTING` table in `maestro.py`) — maps categories to preferred agents
+2. **Dynamic matching** (foreman `match --json`) — scores all agents against the task description
+
+Both must agree for agent dispatch to trigger. When no agent matches, standard CLI routing applies.
+
+**When agents are preferred over CLIs:**
+- Read-only analysis tasks (no sandbox needed)
+- A matching agent exists with score >= 0.15
+- The task doesn't require cross-CLI capabilities
+
+See `/foreman` for agent discovery and management.
+
 ## Important Notes
 
 - **Solo is the default**. Most tasks don't need multi-agent orchestration.
+- Solo may delegate to a sub-agent via foreman for read-only tasks (faster + cheaper than CLI).
 - Pipeline phases pass results forward as context. Each phase builds on the previous.
 - Race mode costs 2-3x more. Only use when quality justifies the cost.
 - Swarm requires the task to be genuinely decomposable. Do not force-split atomic tasks.
