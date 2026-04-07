@@ -8,7 +8,7 @@
 **Duration**: Fastest
 
 ```bash
-$MAESTRO run "Fix the typo in README.md" --cwd /path/to/project
+~/.local/bin/maestro run "Fix the typo in README.md" --cwd /path/to/project
 ```
 
 **How it works**:
@@ -32,7 +32,7 @@ $MAESTRO run "Fix the typo in README.md" --cwd /path/to/project
 **Duration**: Medium (sequential)
 
 ```bash
-$MAESTRO run --pattern pipeline "Build user auth system" --cwd /path/to/project
+~/.local/bin/maestro run --pattern pipeline "Build user auth system" --cwd /path/to/project
 ```
 
 **How it works**:
@@ -62,7 +62,7 @@ $MAESTRO run --pattern pipeline "Build user auth system" --cwd /path/to/project
 **Duration**: Shortest (parallel, limited by slowest)
 
 ```bash
-$MAESTRO run --pattern race "Review this PR for security issues" --cwd /path/to/project
+~/.local/bin/maestro run --pattern race "Review this PR for security issues" --cwd /path/to/project
 ```
 
 **How it works**:
@@ -93,10 +93,10 @@ $MAESTRO run --pattern race "Review this PR for security issues" --cwd /path/to/
 
 ```bash
 # Auto-distribute by category
-$MAESTRO run --pattern swarm "Build auth, profiles, and notifications" --cwd /path/to/project
+~/.local/bin/maestro run --pattern swarm "Build auth, profiles, and notifications" --cwd /path/to/project
 
 # Explicit ratio
-$MAESTRO run --pattern swarm --ratio 3:1:1 "Refactor the entire system" --cwd /path/to/project
+~/.local/bin/maestro run --pattern swarm --ratio 3:1:1 "Refactor the entire system" --cwd /path/to/project
 ```
 
 **How it works (auto)**:
@@ -127,7 +127,7 @@ $MAESTRO run --pattern swarm --ratio 3:1:1 "Refactor the entire system" --cwd /p
 **Duration**: Variable (best case: fast; worst case: 3x)
 
 ```bash
-$MAESTRO run --budget minimize "Explain the auth module" --cwd /path/to/project
+~/.local/bin/maestro run --budget minimize "Explain the auth module" --cwd /path/to/project
 ```
 
 **How it works**:

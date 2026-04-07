@@ -44,20 +44,18 @@
 觸發詞："協作代理"、"分配任務"、"多代理執行"、"用三個 CLI"、"Claude vs Codex vs Gemini 競速"
 
 ```bash
-MAESTRO="python3 ~/.claude/skills/maestro/scripts/maestro.py"
-
 # 自動分析並分配（最常用）
-$MAESTRO run "修復 auth.ts 中的登入 bug" --cwd /path/to/project
+~/.local/bin/maestro run "修復 auth.ts 中的登入 bug" --cwd /path/to/project
 
 # 明確指定模式
-$MAESTRO run --pattern pipeline "建立使用者註冊功能" --cwd /path/to/project
+~/.local/bin/maestro run --pattern pipeline "建立使用者註冊功能" --cwd /path/to/project
 
 # 預覽計畫（不執行）
-$MAESTRO plan "重構整個付款模組"
+~/.local/bin/maestro plan "重構整個付款模組"
 
 # 查看狀態和報告
-$MAESTRO status maestro-20260211-143022
-$MAESTRO report maestro-20260211-143022
+~/.local/bin/maestro status maestro-20260211-143022
+~/.local/bin/maestro report maestro-20260211-143022
 ```
 
 ## 協作模式
@@ -116,7 +114,7 @@ git clone https://github.com/joneshong-skills/maestro.git ~/.claude/skills/maest
 
 前置需求：
 - Python 3.10+
-- 至少安裝一個無頭 CLI 技能（claude-code-headless、codex-headless 或 gemini-cli-headless）
+- 至少安裝一個無頭 CLI 技能（claude-code-headless、codex-cli-headless 或 gemini-cli-headless）
 - `model-mentor` 和 `team-tasks` 技能（用於路由和協調）
 
 ## 專案結構

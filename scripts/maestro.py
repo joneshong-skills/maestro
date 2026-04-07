@@ -5,9 +5,9 @@ Analyzes tasks, selects orchestration patterns, and dispatches work
 to Claude Code, Codex CLI, and Gemini CLI via their headless wrappers.
 
 Depends on:
-  - team-tasks/scripts/task_manager.py  (project coordination)
+  - maestro project  (project coordination)
   - claude-code-headless/scripts/claude_headless.py
-  - codex-headless/scripts/codex_headless.py
+  - codex-cli-headless/scripts/codex_headless.py
   - gemini-cli-headless/scripts/gemini_headless.py
 
 Data dir: ~/.claude/data/maestro/ (override with MAESTRO_DIR)
@@ -23,7 +23,7 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -35,7 +35,7 @@ LOG_DIR = Path.home() / ".claude" / "logs" / "headless"
 
 HEADLESS = {
     "claude": str(SKILLS_DIR / "claude-code-headless" / "scripts" / "claude_headless.py"),
-    "codex": str(SKILLS_DIR / "codex-headless" / "scripts" / "codex_headless.py"),
+    "codex": str(SKILLS_DIR / "codex-cli-headless" / "scripts" / "codex_headless.py"),
     "gemini": str(SKILLS_DIR / "gemini-cli-headless" / "scripts" / "gemini_headless.py"),
 }
 
@@ -44,17 +44,17 @@ FOREMAN = str(SKILLS_DIR / "foreman" / "scripts" / "foreman.py")
 # ── CLI Routing Table ──────────────────────────────────────────────
 
 CLI_ROUTING: dict[str, dict[str, str]] = {
-    "code_generation":  {"primary": "claude", "budget": "gemini", "power": "claude"},
-    "code_review":      {"primary": "claude", "budget": "codex",  "power": "claude"},
-    "debugging":        {"primary": "claude", "budget": "gemini", "power": "claude"},
-    "refactoring":      {"primary": "codex",  "budget": "codex",  "power": "claude"},
-    "architecture":     {"primary": "claude", "budget": "claude", "power": "claude"},
-    "testing":          {"primary": "codex",  "budget": "codex",  "power": "claude"},
-    "long_doc_analysis":{"primary": "gemini", "budget": "gemini", "power": "gemini"},
-    "frontend":         {"primary": "claude", "budget": "gemini", "power": "claude"},
-    "backend":          {"primary": "codex",  "budget": "codex",  "power": "claude"},
-    "security":         {"primary": "claude", "budget": "claude", "power": "claude"},
-    "research":         {"primary": "gemini", "budget": "gemini", "power": "gemini"},
+    "code_generation": {"primary": "codex", "budget": "gemini", "power": "claude"},
+    "code_review": {"primary": "claude", "budget": "codex", "power": "claude"},
+    "debugging": {"primary": "claude", "budget": "gemini", "power": "claude"},
+    "refactoring": {"primary": "codex", "budget": "codex", "power": "claude"},
+    "architecture": {"primary": "claude", "budget": "claude", "power": "claude"},
+    "testing": {"primary": "codex", "budget": "codex", "power": "claude"},
+    "long_doc_analysis": {"primary": "gemini", "budget": "gemini", "power": "gemini"},
+    "frontend": {"primary": "gemini", "budget": "gemini", "power": "claude"},
+    "backend": {"primary": "codex", "budget": "codex", "power": "claude"},
+    "security": {"primary": "claude", "budget": "claude", "power": "claude"},
+    "research": {"primary": "gemini", "budget": "gemini", "power": "gemini"},
 }
 
 # ── Agent Routing (foreman integration) ────────────────────────────
@@ -63,52 +63,183 @@ CLI_ROUTING: dict[str, dict[str, str]] = {
 # instead of spinning up a full CLI process.
 
 AGENT_ROUTING: dict[str, str | None] = {
-    "code_generation":   None,                # needs full CLI (write access, sandbox)
-    "code_review":       "code-reviewer",     # read-only, fast
-    "debugging":         None,                # needs full context + write
-    "refactoring":       None,                # needs write access
-    "architecture":      None,                # needs deep reasoning (CLI)
-    "testing":           None,                # needs execution environment
-    "long_doc_analysis": None,                # needs 1M context (Gemini)
-    "frontend":          None,                # needs write access
-    "backend":           None,                # needs write access
-    "security":          "security-scanner",  # read-only audit
-    "research":          None,                # needs web access (CLI)
+    "code_generation": None,  # needs full CLI (write access, sandbox)
+    "code_review": "code-reviewer",  # read-only, fast
+    "debugging": None,  # needs full context + write
+    "refactoring": None,  # needs write access
+    "architecture": None,  # needs deep reasoning (CLI)
+    "testing": None,  # needs execution environment
+    "long_doc_analysis": None,  # needs 1M context (Gemini)
+    "frontend": None,  # needs write access
+    "backend": None,  # needs write access
+    "security": "security-scanner",  # read-only audit
+    "research": None,  # needs web access (CLI)
 }
 
 
 CATEGORY_KEYWORDS: dict[str, list[str]] = {
-    "code_generation":  ["build", "create", "implement", "write", "add feature", "new feature", "generate",
-                         "建立", "建置", "實作", "寫", "開發", "產生", "新增"],
-    "code_review":      ["review", "check", "audit", "inspect", "PR", "pull request", "code review",
-                         "審查", "檢查", "看一下", "review"],
-    "debugging":        ["fix", "bug", "error", "broken", "not working", "crash", "issue", "debug",
-                         "修", "修復", "修正", "錯誤", "壞了", "除錯"],
-    "refactoring":      ["refactor", "clean up", "restructure", "optimize", "reorganize", "simplify",
-                         "重構", "整理", "優化", "簡化", "重新架構"],
-    "architecture":     ["design", "plan", "architect", "system design", "architecture", "blueprint",
-                         "設計", "規劃", "架構"],
-    "testing":          ["test", "spec", "coverage", "TDD", "unit test", "integration test", "e2e",
-                         "測試", "測試覆蓋", "單元測試", "整合測試"],
-    "long_doc_analysis":["analyze", "summarize", "document", "pdf", "report", "100 page",
-                         "分析", "摘要", "總結", "文件", "報告"],
-    "frontend":         ["UI", "component", "React", "CSS", "layout", "frontend", "page", "form",
-                         "前端", "介面", "元件", "頁面", "表單"],
-    "backend":          ["API", "server", "database", "endpoint", "backend", "REST", "GraphQL",
-                         "後端", "伺服器", "資料庫"],
-    "security":         ["vulnerability", "XSS", "SQL injection", "auth", "security", "penetration",
-                         "安全", "漏洞", "認證", "授權"],
-    "research":         ["research", "compare", "investigate", "explore", "survey", "benchmark",
-                         "研究", "比較", "調查", "探索"],
+    "code_generation": [
+        "build",
+        "create",
+        "implement",
+        "write",
+        "add feature",
+        "new feature",
+        "generate",
+        "建立",
+        "建置",
+        "實作",
+        "寫",
+        "開發",
+        "產生",
+        "新增",
+    ],
+    "code_review": [
+        "review",
+        "check",
+        "audit",
+        "inspect",
+        "PR",
+        "pull request",
+        "code review",
+        "審查",
+        "檢查",
+        "看一下",
+        "review",
+    ],
+    "debugging": [
+        "fix",
+        "bug",
+        "error",
+        "broken",
+        "not working",
+        "crash",
+        "issue",
+        "debug",
+        "修",
+        "修復",
+        "修正",
+        "錯誤",
+        "壞了",
+        "除錯",
+    ],
+    "refactoring": [
+        "refactor",
+        "clean up",
+        "restructure",
+        "optimize",
+        "reorganize",
+        "simplify",
+        "重構",
+        "整理",
+        "優化",
+        "簡化",
+        "重新架構",
+    ],
+    "architecture": [
+        "design",
+        "plan",
+        "architect",
+        "system design",
+        "architecture",
+        "blueprint",
+        "設計",
+        "規劃",
+        "架構",
+    ],
+    "testing": [
+        "test",
+        "spec",
+        "coverage",
+        "TDD",
+        "unit test",
+        "integration test",
+        "e2e",
+        "測試",
+        "測試覆蓋",
+        "單元測試",
+        "整合測試",
+    ],
+    "long_doc_analysis": [
+        "analyze",
+        "summarize",
+        "document",
+        "pdf",
+        "report",
+        "100 page",
+        "分析",
+        "摘要",
+        "總結",
+        "文件",
+        "報告",
+    ],
+    "frontend": [
+        "UI",
+        "component",
+        "React",
+        "CSS",
+        "layout",
+        "frontend",
+        "page",
+        "form",
+        "前端",
+        "介面",
+        "元件",
+        "頁面",
+        "表單",
+    ],
+    "backend": [
+        "API",
+        "server",
+        "database",
+        "endpoint",
+        "backend",
+        "REST",
+        "GraphQL",
+        "後端",
+        "伺服器",
+        "資料庫",
+    ],
+    "security": [
+        "vulnerability",
+        "XSS",
+        "SQL injection",
+        "auth",
+        "security",
+        "penetration",
+        "安全",
+        "漏洞",
+        "認證",
+        "授權",
+    ],
+    "research": [
+        "research",
+        "compare",
+        "investigate",
+        "explore",
+        "survey",
+        "benchmark",
+        "研究",
+        "比較",
+        "調查",
+        "探索",
+    ],
 }
 
 # ── Explicit CLI Name Aliases ─────────────────────────────────────
 # Maps user-facing names to canonical CLI keys.
 CLI_NAME_ALIASES: dict[str, str] = {
-    "claude": "claude", "claude code": "claude", "claude-code": "claude",
-    "codex": "codex", "codex cli": "codex", "codex-cli": "codex",
-    "openai codex": "codex", "openai": "codex",
-    "gemini": "gemini", "gemini cli": "gemini", "gemini-cli": "gemini",
+    "claude": "claude",
+    "claude code": "claude",
+    "claude-code": "claude",
+    "codex": "codex",
+    "codex cli": "codex",
+    "codex-cli": "codex",
+    "openai codex": "codex",
+    "openai": "codex",
+    "gemini": "gemini",
+    "gemini cli": "gemini",
+    "gemini-cli": "gemini",
     "google gemini": "gemini",
 }
 
@@ -121,7 +252,7 @@ def detect_explicit_clis(description: str) -> list[str]:
     before "claude").
     """
     desc_lower = description.lower()
-    found: dict[str, int] = {}   # canonical name → first position
+    found: dict[str, int] = {}  # canonical name → first position
     # Sort aliases longest-first so "claude code" matches before "claude"
     for alias in sorted(CLI_NAME_ALIASES, key=len, reverse=True):
         pos = desc_lower.find(alias)
@@ -131,6 +262,7 @@ def detect_explicit_clis(description: str) -> list[str]:
                 found[canon] = pos
     # Return in order of appearance
     return [cli for cli, _ in sorted(found.items(), key=lambda x: x[1])]
+
 
 # ── Default Pipeline Templates ─────────────────────────────────────
 
@@ -146,7 +278,11 @@ PIPELINE_TEMPLATES: dict[str, list[dict[str, str]]] = {
         {"id": "test", "cli": "codex", "role": "Write and run tests"},
     ],
     "code_review": [
-        {"id": "claude-review", "cli": "claude", "role": "Review for quality and logic"},
+        {
+            "id": "claude-review",
+            "cli": "claude",
+            "role": "Review for quality and logic",
+        },
         {"id": "codex-review", "cli": "codex", "role": "Review for reliability"},
     ],
     "refactoring": [
@@ -165,22 +301,25 @@ PIPELINE_TEMPLATES: dict[str, list[dict[str, str]]] = {
 
 # ── Data Classes ───────────────────────────────────────────────────
 
+
 @dataclass
 class TaskAnalysis:
     description: str
-    complexity: str = "simple"          # simple | moderate | complex
-    decomposability: str = "atomic"     # atomic | sequential | parallel
+    complexity: str = "simple"  # simple | moderate | complex
+    decomposability: str = "atomic"  # atomic | sequential | parallel
     categories: list[str] = field(default_factory=list)
     recommended_pattern: str = "solo"
     phases: list[dict] = field(default_factory=list)
+
 
 @dataclass
 class AgentResult:
     task_id: str
     cli: str
-    status: str         # done | failed | timeout
+    status: str  # done | failed | timeout
     duration_s: float
     output: str = ""
+
 
 @dataclass
 class MaestroProject:
@@ -195,24 +334,26 @@ class MaestroProject:
     completed_at: str = ""
     total_duration_s: float = 0
 
+
 # ── Analysis ───────────────────────────────────────────────────────
+
 
 def _is_cjk(text: str) -> bool:
     """Check if text contains CJK characters (Chinese/Japanese/Korean)."""
-    return bool(re.search(r'[\u4e00-\u9fff\u3400-\u4dbf]', text))
+    return bool(re.search(r"[\u4e00-\u9fff\u3400-\u4dbf]", text))
 
 
 def _word_match(pattern: str, text: str) -> bool:
     """Match a keyword: word-boundary for Latin, substring for CJK."""
     if _is_cjk(pattern):
         return pattern in text
-    return bool(re.search(r'\b' + re.escape(pattern) + r'\b', text, re.IGNORECASE))
+    return bool(re.search(r"\b" + re.escape(pattern) + r"\b", text, re.IGNORECASE))
 
 
 def _effective_word_count(description: str) -> int:
     """Word count with CJK fallback — Chinese chars ÷ 2 as rough word equivalent."""
     words = len(description.split())
-    cjk_chars = len(re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', description))
+    cjk_chars = len(re.findall(r"[\u4e00-\u9fff\u3400-\u4dbf]", description))
     if cjk_chars > 5:
         words += cjk_chars // 2
     return words
@@ -229,19 +370,34 @@ def analyze_task(description: str, budget: str = "balanced") -> TaskAnalysis:
         score = sum(1 for kw in keywords if _word_match(kw, desc_lower))
         if score > 0:
             scores[cat] = score
-    analysis.categories = sorted(scores, key=scores.get, reverse=True) if scores else ["code_generation"]
+    analysis.categories = (
+        sorted(scores, key=scores.get, reverse=True) if scores else ["code_generation"]
+    )
 
     # Assess complexity (with CJK fallback)
     word_count = _effective_word_count(description)
     # Count total occurrences of coordination signals (not just distinct keywords)
-    multi_signal_words = ["and", "then", "also", "plus", "with", "including",
-                          "並且", "然後", "還有", "以及", "同時"]
+    multi_signal_words = [
+        "and",
+        "then",
+        "also",
+        "plus",
+        "with",
+        "including",
+        "並且",
+        "然後",
+        "還有",
+        "以及",
+        "同時",
+    ]
     multi_signals = 0
     for w in multi_signal_words:
         if _is_cjk(w):
             multi_signals += desc_lower.count(w)
         else:
-            multi_signals += len(re.findall(r'\b' + re.escape(w) + r'\b', desc_lower, re.IGNORECASE))
+            multi_signals += len(
+                re.findall(r"\b" + re.escape(w) + r"\b", desc_lower, re.IGNORECASE)
+            )
     if word_count > 50 or multi_signals >= 3:
         analysis.complexity = "complex"
     elif word_count > 20 or multi_signals >= 1:
@@ -250,9 +406,17 @@ def analyze_task(description: str, budget: str = "balanced") -> TaskAnalysis:
         analysis.complexity = "simple"
 
     # Check decomposability (word-boundary for English, substring for CJK particles)
-    seq_signals = any(_word_match(p, desc_lower) for p in [
-        "first", "then", "after that", "finally", "step 1", "phase",
-    ]) or any(p in desc_lower for p in ["先", "然後", "接著", "最後"])
+    seq_signals = any(
+        _word_match(p, desc_lower)
+        for p in [
+            "first",
+            "then",
+            "after that",
+            "finally",
+            "step 1",
+            "phase",
+        ]
+    ) or any(p in desc_lower for p in ["先", "然後", "接著", "最後"])
     par_signals = desc_lower.count(" and ") >= 2 or desc_lower.count("、") >= 2
 
     if seq_signals:
@@ -299,7 +463,11 @@ def select_pattern(analysis: TaskAnalysis, budget: str) -> str:
 
 def route_to_cli(category: str, budget: str = "balanced") -> str:
     """Map task category + budget to a CLI tool name."""
-    tier_map = {"minimize": "budget", "balanced": "primary", "maximize_quality": "power"}
+    tier_map = {
+        "minimize": "budget",
+        "balanced": "primary",
+        "maximize_quality": "power",
+    }
     tier = tier_map.get(budget, "primary")
     routing = CLI_ROUTING.get(category, CLI_ROUTING["code_generation"])
     return routing.get(tier, "claude")
@@ -317,7 +485,9 @@ def check_agent_match(task: str, category: str, threshold: float = 0.15) -> str 
     try:
         result = subprocess.run(
             [sys.executable, FOREMAN, "match", task, "--json"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if result.returncode == 0 and result.stdout.strip():
             matches = json.loads(result.stdout)
@@ -336,20 +506,27 @@ def check_agent_match(task: str, category: str, threshold: float = 0.15) -> str 
     return preferred  # fallback to static routing (may be None)
 
 
-def dispatch_via_agent(agent_name: str, task: str, cwd: str | None = None,
-                       timeout: int = 300) -> AgentResult:
+def dispatch_via_agent(
+    agent_name: str, task: str, cwd: str | None = None, timeout: int = 300
+) -> AgentResult:
     """Dispatch a task to a sub-agent via claude -p with agent instruction.
 
     Uses Claude Code headless to invoke the sub-agent, which is lighter
     than a full CLI dispatch since the agent constrains model/tools.
     """
-    prompt = f'Use the {agent_name} agent to: {task}'
+    prompt = f"Use the {agent_name} agent to: {task}"
     task_id = f"agent-{agent_name}-{int(time.time())}"
     start = time.time()
 
     try:
-        cmd = [sys.executable, HEADLESS["claude"], "-p", prompt,
-               "--output-format", "json"]
+        cmd = [
+            sys.executable,
+            HEADLESS["claude"],
+            "-p",
+            prompt,
+            "--output-format",
+            "json",
+        ]
         if cwd:
             cmd += ["--cwd", cwd]
 
@@ -360,7 +537,7 @@ def dispatch_via_agent(agent_name: str, task: str, cwd: str | None = None,
         # Try to extract result from JSON
         if output:
             try:
-                json_start = output.find('{')
+                json_start = output.find("{")
                 if json_start >= 0:
                     data = json.loads(output[json_start:])
                     output = data.get("result", output)
@@ -368,24 +545,32 @@ def dispatch_via_agent(agent_name: str, task: str, cwd: str | None = None,
                 pass
 
         return AgentResult(
-            task_id=task_id, cli=f"agent:{agent_name}",
+            task_id=task_id,
+            cli=f"agent:{agent_name}",
             status="done" if proc.returncode == 0 else "failed",
-            duration_s=round(elapsed, 1), output=output[:5000],
+            duration_s=round(elapsed, 1),
+            output=output[:5000],
         )
     except subprocess.TimeoutExpired:
         return AgentResult(
-            task_id=task_id, cli=f"agent:{agent_name}",
-            status="timeout", duration_s=timeout,
+            task_id=task_id,
+            cli=f"agent:{agent_name}",
+            status="timeout",
+            duration_s=timeout,
             output="Agent timed out",
         )
     except Exception as e:
         return AgentResult(
-            task_id=task_id, cli=f"agent:{agent_name}",
-            status="failed", duration_s=round(time.time() - start, 1),
+            task_id=task_id,
+            cli=f"agent:{agent_name}",
+            status="failed",
+            duration_s=round(time.time() - start, 1),
             output=f"Agent dispatch error: {e}",
         )
 
+
 # ── Project Management ─────────────────────────────────────────────
+
 
 def generate_project_name() -> str:
     return f"maestro-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
@@ -418,17 +603,21 @@ def list_projects() -> list[dict]:
     for f in sorted(DATA_DIR.glob("maestro-*.json")):
         try:
             data = json.loads(f.read_text())
-            projects.append({
-                "name": data.get("name", f.stem),
-                "pattern": data.get("pattern", "?"),
-                "task": data.get("task", "")[:60],
-                "completed": bool(data.get("completed_at")),
-            })
+            projects.append(
+                {
+                    "name": data.get("name", f.stem),
+                    "pattern": data.get("pattern", "?"),
+                    "task": data.get("task", "")[:60],
+                    "completed": bool(data.get("completed_at")),
+                }
+            )
         except Exception:
             continue
     return projects
 
+
 # ── CLI Dispatch ───────────────────────────────────────────────────
+
 
 def build_cli_cmd(cli: str, prompt: str, cwd: str | None, background: bool) -> list[str]:
     """Build the command list for a headless CLI wrapper."""
@@ -439,7 +628,14 @@ def build_cli_cmd(cli: str, prompt: str, cwd: str | None, background: bool) -> l
     cmd = [sys.executable, script]
 
     if cli == "claude":
-        cmd += ["-p", prompt, "--output-format", "json", "--allowedTools", "Read,Edit,Bash"]
+        cmd += [
+            "-p",
+            prompt,
+            "--output-format",
+            "json",
+            "--allowedTools",
+            "Read,Edit,Bash",
+        ]
         if cwd:
             cmd += ["--cwd", cwd]
     elif cli == "codex":
@@ -457,9 +653,14 @@ def build_cli_cmd(cli: str, prompt: str, cwd: str | None, background: bool) -> l
     return cmd
 
 
-def dispatch_agent(cli: str, prompt: str, cwd: str | None = None,
-                   background: bool = False, timeout: int = 300,
-                   skip_preflight: bool = False) -> AgentResult:
+def dispatch_agent(
+    cli: str,
+    prompt: str,
+    cwd: str | None = None,
+    background: bool = False,
+    timeout: int = 300,
+    skip_preflight: bool = False,
+) -> AgentResult:
     """Launch a CLI agent and collect the result."""
     task_id = f"{cli}-{int(time.time())}"
 
@@ -469,11 +670,14 @@ def dispatch_agent(cli: str, prompt: str, cwd: str | None = None,
         if Path(_shared).is_dir():
             sys.path.insert(0, _shared)
             try:
-                from preflight import run_preflight, Verdict, format_result
+                from preflight import Verdict, format_result, run_preflight
+
                 pf = run_preflight()
                 if pf.verdict == Verdict.BLOCK:
                     return AgentResult(
-                        task_id=task_id, cli=cli, status="blocked",
+                        task_id=task_id,
+                        cli=cli,
+                        status="blocked",
                         duration_s=0,
                         output=f"Pre-flight BLOCKED:\n{format_result(pf)}",
                     )
@@ -500,7 +704,9 @@ def dispatch_agent(cli: str, prompt: str, cwd: str | None = None,
                 if "Log:" in line:
                     log_path = line.split("Log:")[-1].strip()
             return AgentResult(
-                task_id=task_id, cli=cli, status="running",
+                task_id=task_id,
+                cli=cli,
+                status="running",
                 duration_s=0,
                 output=json.dumps({"pid": pid, "log": log_path}),
             )
@@ -513,9 +719,9 @@ def dispatch_agent(cli: str, prompt: str, cwd: str | None = None,
             if cli == "claude" and output:
                 try:
                     # Strip ANSI escape codes (color, cursor, etc.) and control chars
-                    clean = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', output)
-                    clean = clean.lstrip('\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0b\x0c\x0e\x0f')
-                    json_start = clean.find('{')
+                    clean = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", output)
+                    clean = clean.lstrip("\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0b\x0c\x0e\x0f")
+                    json_start = clean.find("{")
                     if json_start >= 0:
                         clean = clean[json_start:]
                     data = json.loads(clean)
@@ -525,17 +731,25 @@ def dispatch_agent(cli: str, prompt: str, cwd: str | None = None,
 
             status = "done" if proc.returncode == 0 else "failed"
             return AgentResult(
-                task_id=task_id, cli=cli, status=status,
-                duration_s=round(elapsed, 1), output=output[:5000],
+                task_id=task_id,
+                cli=cli,
+                status=status,
+                duration_s=round(elapsed, 1),
+                output=output[:5000],
             )
     except subprocess.TimeoutExpired:
         return AgentResult(
-            task_id=task_id, cli=cli, status="timeout",
-            duration_s=timeout, output="Agent timed out",
+            task_id=task_id,
+            cli=cli,
+            status="timeout",
+            duration_s=timeout,
+            output="Agent timed out",
         )
     except Exception as e:
         return AgentResult(
-            task_id=task_id, cli=cli, status="failed",
+            task_id=task_id,
+            cli=cli,
+            status="failed",
             duration_s=round(time.time() - start, 1),
             output=f"Dispatch error: {e}",
         )
@@ -557,29 +771,36 @@ def wait_for_background(pid: str, log_path: str, timeout: int = 300) -> str:
         return Path(log_path).read_text()[-5000:]
     return "(no log output captured)"
 
+
 # ── Pattern Executors ──────────────────────────────────────────────
 
-def execute_solo(project: MaestroProject, timeout: int,
-                 skip_preflight: bool = False) -> MaestroProject:
+
+def execute_solo(
+    project: MaestroProject, timeout: int, skip_preflight: bool = False
+) -> MaestroProject:
     """Single agent, single task."""
     analysis = analyze_task(project.task, project.budget)
     explicit_clis = detect_explicit_clis(project.task)
-    cli = explicit_clis[0] if explicit_clis else route_to_cli(analysis.categories[0], project.budget)
+    cli = (
+        explicit_clis[0] if explicit_clis else route_to_cli(analysis.categories[0], project.budget)
+    )
     project.phases = [{"id": "main", "cli": cli, "role": "Execute the task"}]
 
     print(f"[maestro] Pattern: Solo ({cli})")
     print(f"[1/1] {cli.title()}... dispatching")
 
-    result = dispatch_agent(cli, project.task, project.cwd, timeout=timeout,
-                            skip_preflight=skip_preflight)
+    result = dispatch_agent(
+        cli, project.task, project.cwd, timeout=timeout, skip_preflight=skip_preflight
+    )
     project.results = [asdict(result)]
 
     print(f"[1/1] {cli.title()}... {result.status} ({result.duration_s}s)")
     return project
 
 
-def execute_pipeline(project: MaestroProject, timeout: int,
-                     skip_preflight: bool = False) -> MaestroProject:
+def execute_pipeline(
+    project: MaestroProject, timeout: int, skip_preflight: bool = False
+) -> MaestroProject:
     """Sequential phases, each building on the previous."""
     analysis = analyze_task(project.task, project.budget)
     phases = analysis.phases or PIPELINE_TEMPLATES["code_generation"]
@@ -599,8 +820,9 @@ def execute_pipeline(project: MaestroProject, timeout: int,
             prompt += f"\n\nContext from previous phase:\n{prev_result[:3000]}"
 
         print(f"[{i}/{total}] {role} ({cli.title()})... dispatching")
-        result = dispatch_agent(cli, prompt, project.cwd, timeout=timeout,
-                                skip_preflight=skip_preflight)
+        result = dispatch_agent(
+            cli, prompt, project.cwd, timeout=timeout, skip_preflight=skip_preflight
+        )
         project.results.append(asdict(result))
         prev_result = result.output
 
@@ -613,8 +835,9 @@ def execute_pipeline(project: MaestroProject, timeout: int,
     return project
 
 
-def execute_race(project: MaestroProject, timeout: int,
-                 skip_preflight: bool = False) -> MaestroProject:
+def execute_race(
+    project: MaestroProject, timeout: int, skip_preflight: bool = False
+) -> MaestroProject:
     """Same task to multiple CLIs in parallel, compare results."""
     explicit_clis = detect_explicit_clis(project.task)
     clis = explicit_clis if len(explicit_clis) >= 2 else ["claude", "codex", "gemini"]
@@ -627,8 +850,13 @@ def execute_race(project: MaestroProject, timeout: int,
     bg_info: list[tuple[str, str | None, str | None]] = []
     for cli in clis:
         print(f"  Launching {cli.title()}...")
-        result = dispatch_agent(cli, project.task, project.cwd, background=True,
-                                skip_preflight=skip_preflight)
+        result = dispatch_agent(
+            cli,
+            project.task,
+            project.cwd,
+            background=True,
+            skip_preflight=skip_preflight,
+        )
         info = json.loads(result.output) if result.output else {}
         bg_info.append((cli, info.get("pid"), info.get("log")))
 
@@ -639,25 +867,40 @@ def execute_race(project: MaestroProject, timeout: int,
             start = time.time()
             output = wait_for_background(pid, log_path, timeout)
             elapsed = round(time.time() - start, 1)
-            project.results.append(asdict(AgentResult(
-                task_id=f"{cli}-race", cli=cli,
-                status="done", duration_s=elapsed,
-                output=output[:5000],
-            )))
+            project.results.append(
+                asdict(
+                    AgentResult(
+                        task_id=f"{cli}-race",
+                        cli=cli,
+                        status="done",
+                        duration_s=elapsed,
+                        output=output[:5000],
+                    )
+                )
+            )
             print(f"  {cli.title()} completed ({elapsed}s)")
         else:
-            project.results.append(asdict(AgentResult(
-                task_id=f"{cli}-race", cli=cli,
-                status="failed", duration_s=0,
-                output="Failed to launch background process",
-            )))
+            project.results.append(
+                asdict(
+                    AgentResult(
+                        task_id=f"{cli}-race",
+                        cli=cli,
+                        status="failed",
+                        duration_s=0,
+                        output="Failed to launch background process",
+                    )
+                )
+            )
 
     return project
 
 
-def execute_swarm(project: MaestroProject, timeout: int,
-                  ratio: str | None = None,
-                  skip_preflight: bool = False) -> MaestroProject:
+def execute_swarm(
+    project: MaestroProject,
+    timeout: int,
+    ratio: str | None = None,
+    skip_preflight: bool = False,
+) -> MaestroProject:
     """Distribute subtasks across CLIs by category or ratio."""
     analysis = analyze_task(project.task, project.budget)
 
@@ -669,11 +912,13 @@ def execute_swarm(project: MaestroProject, timeout: int,
         for i, count in enumerate(parts):
             cli = cli_names[i] if i < len(cli_names) else cli_names[-1]
             for j in range(int(count)):
-                task_assignments.append({
-                    "id": f"{cli}-{j+1}",
-                    "cli": cli,
-                    "role": f"Subtask (assigned to {cli})",
-                })
+                task_assignments.append(
+                    {
+                        "id": f"{cli}-{j + 1}",
+                        "cli": cli,
+                        "role": f"Subtask (assigned to {cli})",
+                    }
+                )
         project.phases = task_assignments
     else:
         # Use categories to distribute
@@ -681,11 +926,13 @@ def execute_swarm(project: MaestroProject, timeout: int,
         project.phases = []
         for cat in categories:
             cli = route_to_cli(cat, project.budget)
-            project.phases.append({
-                "id": f"{cat}-{cli}",
-                "cli": cli,
-                "role": f"Handle {cat.replace('_', ' ')} aspect",
-            })
+            project.phases.append(
+                {
+                    "id": f"{cat}-{cli}",
+                    "cli": cli,
+                    "role": f"Handle {cat.replace('_', ' ')} aspect",
+                }
+            )
 
     total = len(project.phases)
     print(f"[maestro] Pattern: Swarm ({total} subtasks)")
@@ -696,8 +943,9 @@ def execute_swarm(project: MaestroProject, timeout: int,
         cli = phase["cli"]
         prompt = f"Task: {project.task}\n\nFocus on: {phase['role']}"
         print(f"  Launching {phase['id']} ({cli})...")
-        result = dispatch_agent(cli, prompt, project.cwd, background=True,
-                                skip_preflight=skip_preflight)
+        result = dispatch_agent(
+            cli, prompt, project.cwd, background=True, skip_preflight=skip_preflight
+        )
         info = json.loads(result.output) if result.output else {}
         bg_info.append((phase, info.get("pid"), info.get("log")))
 
@@ -708,28 +956,42 @@ def execute_swarm(project: MaestroProject, timeout: int,
             start = time.time()
             output = wait_for_background(pid, log_path, timeout)
             elapsed = round(time.time() - start, 1)
-            project.results.append(asdict(AgentResult(
-                task_id=phase["id"], cli=phase["cli"],
-                status="done", duration_s=elapsed,
-                output=output[:5000],
-            )))
+            project.results.append(
+                asdict(
+                    AgentResult(
+                        task_id=phase["id"],
+                        cli=phase["cli"],
+                        status="done",
+                        duration_s=elapsed,
+                        output=output[:5000],
+                    )
+                )
+            )
             print(f"  {phase['id']} completed ({elapsed}s)")
 
     return project
 
 
-def execute_escalation(project: MaestroProject, timeout: int,
-                       skip_preflight: bool = False) -> MaestroProject:
+def execute_escalation(
+    project: MaestroProject, timeout: int, skip_preflight: bool = False
+) -> MaestroProject:
     """Start cheap, escalate on failure or low quality."""
     chain = ["gemini", "codex", "claude"]  # cheapest → most expensive
-    project.phases = [{"id": f"attempt-{cli}", "cli": cli, "role": f"Attempt ({cli})"} for cli in chain]
+    project.phases = [
+        {"id": f"attempt-{cli}", "cli": cli, "role": f"Attempt ({cli})"} for cli in chain
+    ]
 
     print(f"[maestro] Pattern: Escalation (chain: {' → '.join(c.title() for c in chain)})")
 
     for i, cli in enumerate(chain, 1):
         print(f"[{i}/{len(chain)}] Trying {cli.title()}...")
-        result = dispatch_agent(cli, project.task, project.cwd, timeout=timeout,
-                                skip_preflight=skip_preflight)
+        result = dispatch_agent(
+            cli,
+            project.task,
+            project.cwd,
+            timeout=timeout,
+            skip_preflight=skip_preflight,
+        )
         project.results.append(asdict(result))
 
         if result.status == "done" and quality_check(result.output):
@@ -750,7 +1012,9 @@ def quality_check(output: str) -> bool:
     lower = output.lower()
     return not any(sig in lower for sig in error_signals)
 
+
 # ── Report Generation ──────────────────────────────────────────────
+
 
 def generate_report(project: MaestroProject, as_json: bool = False) -> str:
     """Generate a structured report from a completed project."""
@@ -793,18 +1057,27 @@ def generate_report(project: MaestroProject, as_json: bool = False) -> str:
 
     return "\n".join(lines)
 
+
 # ── macOS Notification ─────────────────────────────────────────────
+
 
 def notify(title: str, message: str):
     try:
-        subprocess.run([
-            "osascript", "-e",
-            f'display notification "{message}" with title "{title}"'
-        ], capture_output=True, timeout=5)
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                f'display notification "{message}" with title "{title}"',
+            ],
+            capture_output=True,
+            timeout=5,
+        )
     except Exception:
         pass
 
+
 # ── Main CLI ───────────────────────────────────────────────────────
+
 
 def cmd_run(args):
     """Analyze task and execute."""
@@ -834,7 +1107,7 @@ def cmd_run(args):
     start = time.time()
 
     # Execute pattern
-    sp = getattr(args, 'skip_preflight', False)
+    sp = getattr(args, "skip_preflight", False)
     executors = {
         "solo": execute_solo,
         "pipeline": execute_pipeline,
@@ -874,14 +1147,16 @@ def cmd_plan(args):
         # Rebuild phases if pattern was overridden to pipeline
         if args.pattern == "pipeline":
             primary_cat = analysis.categories[0]
-            analysis.phases = PIPELINE_TEMPLATES.get(primary_cat, PIPELINE_TEMPLATES["code_generation"])
+            analysis.phases = PIPELINE_TEMPLATES.get(
+                primary_cat, PIPELINE_TEMPLATES["code_generation"]
+            )
         elif args.pattern != "pipeline":
             analysis.phases = []
 
     # Detect explicitly mentioned CLIs
     explicit_clis = detect_explicit_clis(task)
 
-    print(f"=== Maestro Plan (dry-run) ===")
+    print("=== Maestro Plan (dry-run) ===")
     print(f"Task: {task}")
     print(f"Complexity: {analysis.complexity}")
     print(f"Decomposability: {analysis.decomposability}")
@@ -990,22 +1265,31 @@ def main():
     p_run.add_argument("--pattern", choices=["solo", "pipeline", "race", "swarm", "escalation"])
     p_run.add_argument("--ratio", help="CLI ratio for swarm (e.g., 3:1:1)")
     p_run.add_argument("--cwd", help="Working directory")
-    p_run.add_argument("--budget", default="balanced",
-                       choices=["minimize", "balanced", "maximize_quality"])
+    p_run.add_argument(
+        "--budget",
+        default="balanced",
+        choices=["minimize", "balanced", "maximize_quality"],
+    )
     p_run.add_argument("--timeout", type=int, default=300)
     p_run.add_argument("--project", help="Custom project name")
     p_run.add_argument("--notify", action="store_true")
     p_run.add_argument("--json", action="store_true")
-    p_run.add_argument("--skip-preflight", action="store_true",
-                       help="Skip resource pre-flight checks (memory/context)")
+    p_run.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="Skip resource pre-flight checks (memory/context)",
+    )
 
     # ── plan ──
     p_plan = sub.add_parser("plan", help="Analyze task (dry-run)")
     p_plan.add_argument("task", nargs="+", help="Task description")
     p_plan.add_argument("--pattern", choices=["solo", "pipeline", "race", "swarm", "escalation"])
     p_plan.add_argument("--ratio", help="CLI ratio for swarm")
-    p_plan.add_argument("--budget", default="balanced",
-                        choices=["minimize", "balanced", "maximize_quality"])
+    p_plan.add_argument(
+        "--budget",
+        default="balanced",
+        choices=["minimize", "balanced", "maximize_quality"],
+    )
     p_plan.add_argument("--json", action="store_true")
 
     # ── status ──

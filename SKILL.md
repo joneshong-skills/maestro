@@ -341,6 +341,10 @@ This skill evolves with each use. After every invocation:
 
 Accumulated lessons signal when to run `/skill-optimizer` for a deeper structural review.
 
+## See Also
+
+- **`team-tasks`** — For native agent team collaboration (real-time multi-agent with shared task list and mailbox), use `team-tasks` instead of maestro.
+
 ## Additional Resources
 
 ### Reference Files

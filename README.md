@@ -44,20 +44,18 @@
 Trigger phrases: "orchestrate agents", "dispatch a task", "run multi-agent", "use all three CLIs", "race Claude vs Codex vs Gemini"
 
 ```bash
-MAESTRO="python3 ~/.claude/skills/maestro/scripts/maestro.py"
-
 # Auto-analyze and dispatch (most common)
-$MAESTRO run "Fix the login bug in auth.ts" --cwd /path/to/project
+~/.local/bin/maestro run "Fix the login bug in auth.ts" --cwd /path/to/project
 
 # Explicit pattern selection
-$MAESTRO run --pattern pipeline "Build user registration" --cwd /path/to/project
+~/.local/bin/maestro run --pattern pipeline "Build user registration" --cwd /path/to/project
 
 # Dry-run to preview the plan
-$MAESTRO plan "Refactor the entire payments module"
+~/.local/bin/maestro plan "Refactor the entire payments module"
 
 # Check status and view report
-$MAESTRO status maestro-20260211-143022
-$MAESTRO report maestro-20260211-143022
+~/.local/bin/maestro status maestro-20260211-143022
+~/.local/bin/maestro report maestro-20260211-143022
 ```
 
 ## Orchestration Patterns
@@ -116,7 +114,7 @@ git clone https://github.com/joneshong-skills/maestro.git ~/.claude/skills/maest
 
 Prerequisites:
 - Python 3.10+
-- At least one headless CLI skill installed (claude-code-headless, codex-headless, or gemini-cli-headless)
+- At least one headless CLI skill installed (claude-code-headless, codex-cli-headless, or gemini-cli-headless)
 - The `model-mentor` and `team-tasks` skills (used for routing and coordination)
 
 ## Project Structure
