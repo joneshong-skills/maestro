@@ -311,6 +311,62 @@ Both must agree for agent dispatch to trigger. When no agent matches, standard C
 
 See `/foreman` for agent discovery and management.
 
+## Role Routing (Declarative Config Layer)
+
+Routing decisions can be overridden via jsonc config — no need to edit `maestro.py`.
+Cannibalized from oh-my-claudecode's `team.roleRouting` pattern.
+
+### Precedence (highest → lowest)
+
+1. `MAESTRO_ROLE_OVERRIDES` env var (JSON string)
+2. `<cwd>/.claude/maestro.jsonc` (project)
+3. `~/.claude/maestro.jsonc` (user)
+4. Built-in `DEFAULT_ROLE_ROUTING` in `scripts/role_routing.py`
+
+### Schema
+
+```jsonc
+{
+  "maestro": {
+    "roleRouting": {
+      "code_review":       { "provider": "codex" },
+      "security":          { "provider": "claude", "model": "HIGH" },
+      "long_doc_analysis": { "provider": "gemini", "model": "HIGH" }
+    },
+    "tierModels": {
+      "codex": { "HIGH": "gpt-5", "MEDIUM": "gpt-5-codex" }
+    }
+  }
+}
+```
+
+- **provider**: `claude | codex | gemini`
+- **model**: tier (`HIGH | MEDIUM | LOW`) or explicit id (`opus`, `gpt-5`, etc.) or `inherit`
+- **tierModels**: optional per-provider tier → model mapping
+
+### Role aliases
+
+The resolver normalizes common aliases — `reviewer→code_review`, `tester→testing`,
+`architect→architecture`, `executor→code_generation`, `harsh-critic→code_review`, etc.
+See `ROLE_ALIASES` in `scripts/role_routing.py` for the full list.
+
+### Loud fallback
+
+If a configured CLI (`codex`, `gemini`) is missing from PATH, maestro falls back to
+`claude` at the same tier and **prints a visible warning to stderr**. Silent fallback
+is treated as a bug — install the missing CLI or update config.
+
+### Diagnosis CLI
+
+```bash
+~/.local/bin/python3 ~/.claude/skills/maestro/scripts/role_routing.py doctor
+~/.local/bin/python3 ~/.claude/skills/maestro/scripts/role_routing.py resolve code-reviewer --json
+```
+
+### Example
+
+See `examples/maestro.jsonc` for a complete config with comments.
+
 ## Important Notes
 
 - **Solo is the default**. Most tasks don't need multi-agent orchestration.
