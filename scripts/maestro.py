@@ -461,16 +461,37 @@ def select_pattern(analysis: TaskAnalysis, budget: str) -> str:
     return "race"
 
 
-def route_to_cli(category: str, budget: str = "balanced") -> str:
-    """Map task category + budget to a CLI tool name."""
-    tier_map = {
-        "minimize": "budget",
-        "balanced": "primary",
-        "maximize_quality": "power",
-    }
-    tier = tier_map.get(budget, "primary")
-    routing = CLI_ROUTING.get(category, CLI_ROUTING["code_generation"])
-    return routing.get(tier, "claude")
+def route_to_cli(category: str, budget: str = "balanced", cwd: str | None = None) -> str:
+    """Map task category + budget to a CLI tool name.
+
+    Resolution order (highest → lowest):
+      1. env MAESTRO_ROLE_OVERRIDES (JSON)
+      2. <cwd>/.claude/maestro.jsonc (project)
+      3. ~/.claude/maestro.jsonc (user)
+      4. DEFAULT_ROLE_ROUTING in role_routing.py
+      5. Built-in CLI_ROUTING table (this file) — final fallback
+
+    When role_routing config is present, it takes precedence over CLI_ROUTING.
+    Otherwise behavior matches legacy maestro.
+
+    Loud fallback: if configured CLI is missing from PATH, falls back to claude
+    and prints a stderr warning (never silent — silent fallback is a bug).
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).parent))
+        from role_routing import resolve_routing
+        resolved = resolve_routing(category, budget=budget, project_cwd=cwd)
+        return resolved.provider
+    except (ImportError, Exception):
+        # Legacy fallback: original CLI_ROUTING table
+        tier_map = {
+            "minimize": "budget",
+            "balanced": "primary",
+            "maximize_quality": "power",
+        }
+        tier = tier_map.get(budget, "primary")
+        routing = CLI_ROUTING.get(category, CLI_ROUTING["code_generation"])
+        return routing.get(tier, "claude")
 
 
 def check_agent_match(task: str, category: str, threshold: float = 0.15) -> str | None:
@@ -782,7 +803,9 @@ def execute_solo(
     analysis = analyze_task(project.task, project.budget)
     explicit_clis = detect_explicit_clis(project.task)
     cli = (
-        explicit_clis[0] if explicit_clis else route_to_cli(analysis.categories[0], project.budget)
+        explicit_clis[0]
+        if explicit_clis
+        else route_to_cli(analysis.categories[0], project.budget, cwd=project.cwd)
     )
     project.phases = [{"id": "main", "cli": cli, "role": "Execute the task"}]
 
@@ -925,7 +948,7 @@ def execute_swarm(
         categories = analysis.categories[:5]  # max 5 subtasks
         project.phases = []
         for cat in categories:
-            cli = route_to_cli(cat, project.budget)
+            cli = route_to_cli(cat, project.budget, cwd=project.cwd)
             project.phases.append(
                 {
                     "id": f"{cat}-{cli}",
@@ -1171,7 +1194,7 @@ def cmd_plan(args):
         if explicit_clis:
             cli = explicit_clis[0]
         else:
-            cli = route_to_cli(analysis.categories[0], args.budget)
+            cli = route_to_cli(analysis.categories[0], args.budget, cwd=args.cwd)
         print(f"Will dispatch to: {cli.title()}")
 
     elif pattern == "pipeline":
@@ -1199,7 +1222,7 @@ def cmd_plan(args):
         else:
             print("Swarm subtasks (by category):")
             for cat in analysis.categories[:5]:
-                cli = route_to_cli(cat, args.budget)
+                cli = route_to_cli(cat, args.budget, cwd=args.cwd)
                 print(f"  - {cat}: {cli.title()}")
 
     elif pattern == "escalation":
@@ -1285,6 +1308,7 @@ def main():
     p_plan.add_argument("task", nargs="+", help="Task description")
     p_plan.add_argument("--pattern", choices=["solo", "pipeline", "race", "swarm", "escalation"])
     p_plan.add_argument("--ratio", help="CLI ratio for swarm")
+    p_plan.add_argument("--cwd", default=None, help="Project root for role-routing config lookup")
     p_plan.add_argument(
         "--budget",
         default="balanced",

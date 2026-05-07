@@ -1,0 +1,55 @@
+// maestro role-routing example config
+//
+// Place this file at:
+//   ~/.claude/maestro.jsonc                  (user-level)
+//   <project>/.claude/maestro.jsonc          (project override)
+//
+// Or pass via env: MAESTRO_ROLE_OVERRIDES='{"roleRouting":...}'
+//
+// Precedence (highest → lowest):
+//   1. env MAESTRO_ROLE_OVERRIDES
+//   2. project .claude/maestro.jsonc
+//   3. user ~/.claude/maestro.jsonc
+//   4. built-in DEFAULT_ROLE_ROUTING
+//
+// Provider must be one of: claude | codex | gemini
+// Model can be:
+//   - Tier name: "HIGH" | "MEDIUM" | "LOW"  (recommended — decoupled from model id)
+//   - Explicit model id: "opus", "gpt-5", "gemini-2.5-pro", etc
+//   - "inherit": follow caller's session model
+//
+// Loud fallback: if a configured CLI is missing from PATH, maestro falls back
+// to claude/MEDIUM and prints a stderr warning. Silent fallback is a bug.
+
+{
+  "maestro": {
+    "roleRouting": {
+      // Codex specializes in security/refactoring → assign critic + reviewer there
+      "code_review":     { "provider": "codex" },
+      "security":        { "provider": "codex" },
+
+      // Gemini for long-context + research/UI work
+      "long_doc_analysis": { "provider": "gemini", "model": "HIGH" },
+      "research":          { "provider": "gemini" },
+      "frontend":          { "provider": "gemini", "model": "MEDIUM" },
+
+      // Claude for architecture + debugging (deep reasoning)
+      "architecture":    { "provider": "claude", "model": "HIGH" },
+      "debugging":       { "provider": "claude" },
+
+      // Codex for codegen + testing (fast iteration)
+      "code_generation": { "provider": "codex" },
+      "testing":         { "provider": "codex" },
+      "refactoring":     { "provider": "codex" },
+      "backend":         { "provider": "codex" }
+    },
+
+    // Optional: override tier → model mappings per provider
+    // Defaults are sensible — only override if you want non-standard models
+    "tierModels": {
+      "claude": { "HIGH": "opus", "MEDIUM": "sonnet", "LOW": "haiku" },
+      "codex":  { "HIGH": "gpt-5", "MEDIUM": "gpt-5-codex", "LOW": "gpt-5-codex" },
+      "gemini": { "HIGH": "gemini-2.5-pro", "MEDIUM": "gemini-2.5-flash" }
+    }
+  }
+}
