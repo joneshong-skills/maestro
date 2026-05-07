@@ -8,9 +8,9 @@ description: >-
   "分配任務給不同模型", "多 CLI 協作",
   mentions multi-CLI orchestration, agent routing, parallel execution,
   CP-value dispatch, or multi-model workflows.
-version: 0.2.1
+version: 0.3.0
 tools: Read, Bash, Edit
-argument-hint: "<task description> [--pattern solo|pipeline|race|swarm|escalation]"
+argument-hint: "<task description> [--pattern solo|pipeline|race|swarm|escalation|synthesis]"
 ---
 
 # Maestro
@@ -65,15 +65,25 @@ $MAESTRO status maestro-20260211-143022
 $MAESTRO report maestro-20260211-143022
 ```
 
-## Five Orchestration Patterns
+## Six Orchestration Patterns
 
 | Pattern | Agents | When to use |
 |---------|--------|-------------|
 | **Solo** | 1 | Simple, well-defined, single-scope tasks (may delegate to sub-agent via foreman) |
 | **Pipeline** | 2-5 seq | Multi-phase work (plan → implement → review) |
-| **Race** | 2-3 parallel | Quality-critical; compare outputs from multiple CLIs |
+| **Race** | 2-3 parallel | Quality-critical; pick the best of N independent attempts |
+| **Synthesis** | 2-3 advisors → 1 synthesizer | Multi-perspective decisions where you want **one merged answer** with explicit consensus/conflicts (not a winner) |
 | **Swarm** | 3+ parallel | Large task decomposable into independent subtasks |
 | **Escalation** | 1→upgrade | Budget-first; start cheap, upgrade only if quality insufficient |
+
+**Race vs Synthesis** — they look similar (parallel CLIs), but the output shape differs:
+
+| | Race | Synthesis |
+|--|------|-----------|
+| Phases | 1 (parallel) | 2 (parallel advisors → 1 synthesizer) |
+| Output | N candidate answers | 1 unified answer with `## Consensus / ## Conflicts / ## Final Direction` |
+| Use when | "Quality is critical, compare and pick" | "Need multi-perspective input merged into one decision" |
+| Cost | N × CLI | (N+1) × CLI |
 
 ## Workflow
 
@@ -114,9 +124,15 @@ Apply the decision tree (full version in `references/decision-tree.md`):
 ```
 User specified --pattern? → Use that pattern.
 
+Task asks for multi-perspective / cross-validation / second opinion?
+  └── Synthesis (parallel advisors → one merged answer)
+      Triggers: "cross-validate", "second opinion", "multi-perspective",
+                "reconcile", "synthesize", "tri-model", "ccg",
+                "多視角", "綜合", "跨驗證", "第二意見"
+
 Single well-defined task?
   ├── Quality standard → Solo (cheapest capable CLI)
-  └── Quality critical → Race (2-3 CLIs)
+  └── Quality critical → Race (2-3 CLIs, pick best)
 
 Has sequential phases?
   └── Pipeline (assign best CLI per phase)
@@ -247,8 +263,80 @@ $MAESTRO report <project-name>
 ```
 
 For Race pattern, compare outputs and recommend the best.
+For Synthesis pattern, the final answer is the synthesizer's output (advisor outputs are kept for audit).
 For Pipeline, show results per phase with pass/fail status.
 For Swarm, aggregate all subtask results.
+
+## Synthesis Pattern (CCG)
+
+Cannibalized from oh-my-claudecode's `ccg/SKILL.md` — Tri-Model Synthesis.
+Adapted to maestro's dispatcher (no `omc ask` wrapper needed; uses our HEADLESS layer directly).
+
+### When to Use
+
+- Architecture/correctness review **and** UX/alternatives review on the same task
+- Cross-validation where Codex and Gemini may legitimately disagree
+- "Second opinion" requests — the user wants both perspectives, not a winner
+- Decisions where you want explicit consensus and explicit conflicts surfaced
+
+### How It Works
+
+```
+Phase 1 (parallel):
+  ├── Advisor 1 (codex)  ← perspective: architecture / backend / risks
+  └── Advisor 2 (gemini) ← perspective: UX / alternatives / accessibility
+
+Phase 2 (synthesis):
+  Synthesizer (claude) ← receives both outputs + reconciliation prompt
+                          → emits ONE answer with required sections:
+                            ## Consensus
+                            ## Conflicts
+                            ## Final Direction
+                            ## Action Checklist
+```
+
+The synthesizer is **forced distinct** from the advisors — synthesizing your own output
+is an echo chamber. Default split: codex+gemini advise, claude synthesizes.
+
+### Invocation
+
+```bash
+# Auto-detect (any of: cross-validate, second opinion, multi-perspective, ccg, 多視角, 跨驗證)
+$MAESTRO run "Cross-validate this auth design with a second opinion from codex and gemini"
+
+# Explicit pattern
+$MAESTRO run --pattern synthesis "Review this PR — architecture and UX"
+
+# Custom advisors / synthesizer
+$MAESTRO run --pattern synthesis --advisors codex,gemini,qwen --synthesizer claude \
+  "Design the rate-limit strategy for the public API"
+```
+
+### Perspective Hints
+
+Each advisor automatically receives a perspective hint so outputs complement rather than duplicate:
+
+| Advisor | Default perspective |
+|---------|---------------------|
+| codex | architecture, correctness, backend, edge cases, risks |
+| gemini | UX, alternatives, accessibility, edge-case usability, trade-offs |
+| claude | root cause, cross-system implications, integration |
+| qwen | cost-quality trade-offs, pragmatic minimal-effort |
+| copilot | idiomatic patterns, ecosystem conventions |
+
+Override perspectives via `references/synthesis-protocol.md` (full prompt template + tuning guide).
+
+### Failure Modes
+
+- **All advisors fail** — synthesis is skipped; report shows advisor failures only.
+- **Some advisors fail** — synthesis runs with available outputs and warns about missing perspective.
+- **Synthesizer fails** — advisor outputs are kept; report flags incomplete synthesis.
+
+### Cost Note
+
+Synthesis = (N advisors + 1 synthesizer) calls. For N=2, that's 3× a Solo call.
+Race with 2 CLIs costs 2 calls but produces 2 answers requiring user comparison.
+**Pick synthesis when you want one answer; pick race when you want N answers.**
 
 ## Default Pipeline Templates
 
@@ -277,9 +365,11 @@ $MAESTRO list                       # List all maestro projects
 $MAESTRO report PROJECT             # Show final report
 
 Options:
-  --pattern PATTERN                 # Force: solo|pipeline|race|swarm|escalation
+  --pattern PATTERN                 # Force: solo|pipeline|race|swarm|escalation|synthesis
   --interactive                     # Use interactive (tmux) mode instead of headless
   --ratio RATIO                     # Swarm ratio: "3:1:1" (claude:codex:gemini)
+  --advisors LIST                   # Synthesis advisors (comma-sep, default: codex,gemini)
+  --synthesizer CLI                 # Synthesis synthesizer (default: claude)
   --cwd PATH                        # Working directory for agents
   --budget BUDGET                   # minimize|balanced|maximize_quality
   --timeout SECONDS                 # Per-agent timeout (default: 300)

@@ -299,6 +299,79 @@ PIPELINE_TEMPLATES: dict[str, list[dict[str, str]]] = {
     ],
 }
 
+# ── Synthesis (CCG) Perspectives ───────────────────────────────────
+# Each advisor receives a perspective hint so outputs are complementary,
+# not duplicate. Cannibalized from oh-my-claudecode's ccg/SKILL.md
+# (Yeachan-Heo/oh-my-claudecode), adapted to maestro's dispatcher model.
+
+SYNTHESIS_PERSPECTIVES: dict[str, str] = {
+    "codex": (
+        "Focus on architecture, correctness, backend design, edge cases, and risks. "
+        "Cite specific code patterns or files when relevant."
+    ),
+    "gemini": (
+        "Focus on UX/content clarity, alternative approaches, accessibility, "
+        "edge-case usability, and trade-offs. Surface angles the user may not have considered."
+    ),
+    "claude": (
+        "Focus on root cause analysis, cross-system implications, and integration concerns."
+    ),
+    "qwen": "Focus on cost-quality trade-offs and pragmatic minimal-effort solutions.",
+    "copilot": "Focus on idiomatic patterns and ecosystem conventions.",
+}
+
+# Final synthesis pass — integrates advisor outputs into ONE decision with
+# explicit consensus/conflicts/direction sections. The synthesizer must NOT
+# paper over disagreements — that is the whole point of the protocol.
+SYNTHESIS_PROMPT_TEMPLATE = """\
+You are synthesizing perspectives from {n} independent advisors who evaluated the same task.
+
+Original task:
+---
+{task}
+---
+
+{advisor_blocks}
+
+Produce ONE unified response with these REQUIRED sections (use exact headings):
+
+## Consensus
+Points where all advisors agreed. List as bullets.
+
+## Conflicts
+Points where advisors disagreed. For each conflict:
+- State the disagreement
+- Each advisor's reasoning (cite which advisor)
+- Which view is stronger and why
+
+## Final Direction
+Your synthesized recommendation. For each decision, cite which advisor influenced it
+(or note when you departed from all of them and why).
+
+## Action Checklist
+Concrete next steps in priority order. Each step <= 1 sentence.
+
+Rules:
+- Be explicit when one advisor was clearly wrong — do not paper over disagreements.
+- Be explicit when both perspectives were valid for different parts of the task.
+- Do NOT just summarize each advisor in turn — integrate.
+"""
+
+# Signals that auto-route to synthesis pattern when no --pattern is specified.
+SYNTHESIS_SIGNALS: list[str] = [
+    "cross-validation", "cross validate", "cross-validate",
+    "second opinion", "multiple perspectives", "multi-perspective",
+    "reconcile", "synthesize", "synthesis", "tri-model", "ccg",
+    "多視角", "綜合", "跨驗證", "第二意見", "整合多家",
+]
+
+
+def detect_synthesis_signal(description: str) -> bool:
+    """Return True when the task explicitly asks for multi-perspective synthesis."""
+    desc_lower = description.lower()
+    return any(sig in desc_lower for sig in SYNTHESIS_SIGNALS)
+
+
 # ── Data Classes ───────────────────────────────────────────────────
 
 
@@ -442,6 +515,11 @@ def analyze_task(description: str, budget: str = "balanced") -> TaskAnalysis:
 
 def select_pattern(analysis: TaskAnalysis, budget: str) -> str:
     """Apply decision tree to select orchestration pattern."""
+    # Synthesis: explicit multi-perspective / cross-validation request
+    # (checked before budget so the user's intent wins over cost preference)
+    if detect_synthesis_signal(analysis.description):
+        return "synthesis"
+
     if budget == "minimize":
         return "escalation"
 
@@ -918,6 +996,168 @@ def execute_race(
     return project
 
 
+def execute_synthesis(
+    project: MaestroProject,
+    timeout: int,
+    skip_preflight: bool = False,
+    advisors: list[str] | None = None,
+    synthesizer: str = "claude",
+) -> MaestroProject:
+    """Tri-model synthesis: dispatch advisors in parallel with perspective-specific
+    prompts, then run a final synthesis pass that reconciles outputs.
+
+    Cannibalized from oh-my-claudecode's ccg/SKILL.md, adapted to maestro's
+    dispatcher (no `omc ask` wrapper — uses our HEADLESS dispatchers directly).
+
+    Synthesis vs Race:
+      - Race picks a winner; user compares outputs themselves.
+      - Synthesis emits ONE answer with explicit Consensus/Conflicts/Direction sections.
+
+    Default advisors: codex (architecture/backend) + gemini (UX/alternatives).
+    Synthesizer (default claude) is forced distinct from advisors to avoid bias.
+    """
+    # Resolve advisor list
+    explicit = detect_explicit_clis(project.task)
+    if advisors:
+        candidate = [c for c in advisors if c in HEADLESS]
+    elif len(explicit) >= 2:
+        candidate = explicit[:3]
+    else:
+        candidate = ["codex", "gemini"]
+
+    # Force synthesizer distinct from advisors (else echo chamber)
+    advisor_clis = [c for c in candidate if c != synthesizer]
+    if not advisor_clis:
+        advisor_clis = ["codex", "gemini"]
+
+    project.phases = [
+        {
+            "id": f"advisor-{cli}",
+            "cli": cli,
+            "role": SYNTHESIS_PERSPECTIVES.get(cli, "Independent assessment"),
+        }
+        for cli in advisor_clis
+    ] + [
+        {
+            "id": "synthesizer",
+            "cli": synthesizer,
+            "role": "Reconcile advisor outputs into unified decision",
+        }
+    ]
+
+    print(
+        f"[maestro] Pattern: Synthesis ({len(advisor_clis)} advisors "
+        f"→ {synthesizer.title()} synthesizer)"
+    )
+
+    # Phase 1 — parallel advisor dispatch with perspective hints
+    bg_info: list[tuple[str, str | None, str | None]] = []
+    for cli in advisor_clis:
+        perspective = SYNTHESIS_PERSPECTIVES.get(cli, "Provide independent assessment.")
+        prompt = (
+            f"Task: {project.task}\n\n"
+            f"Your perspective: {perspective}\n\n"
+            "Keep your response focused (under ~800 words) — another model "
+            "will synthesize your output with other advisors' perspectives."
+        )
+        print(f"  Dispatching advisor {cli.title()}...")
+        result = dispatch_agent(
+            cli, prompt, project.cwd, background=True, skip_preflight=skip_preflight
+        )
+        info = json.loads(result.output) if result.output else {}
+        bg_info.append((cli, info.get("pid"), info.get("log")))
+
+    # Wait for all advisors
+    advisor_outputs: dict[str, str] = {}
+    print(f"[maestro] Waiting for {len(advisor_clis)} advisors (timeout: {timeout}s)...")
+    for cli, pid, log_path in bg_info:
+        if pid:
+            start = time.time()
+            output = wait_for_background(pid, log_path, timeout)
+            elapsed = round(time.time() - start, 1)
+            advisor_outputs[cli] = output
+            project.results.append(
+                asdict(
+                    AgentResult(
+                        task_id=f"advisor-{cli}",
+                        cli=cli,
+                        status="done",
+                        duration_s=elapsed,
+                        output=output[:5000],
+                    )
+                )
+            )
+            print(f"  Advisor {cli.title()} returned ({elapsed}s, {len(output)} chars)")
+        else:
+            advisor_outputs[cli] = ""
+            project.results.append(
+                asdict(
+                    AgentResult(
+                        task_id=f"advisor-{cli}",
+                        cli=cli,
+                        status="failed",
+                        duration_s=0,
+                        output="Failed to launch background process",
+                    )
+                )
+            )
+            print(f"  Advisor {cli.title()} FAILED to launch")
+
+    # Phase 2 — synthesis pass
+    available = {k: v for k, v in advisor_outputs.items() if v}
+    if not available:
+        print("[maestro] All advisors failed — skipping synthesis")
+        return project
+
+    if len(available) < len(advisor_clis):
+        missing = [c for c in advisor_clis if c not in available]
+        print(
+            f"[maestro] Warning: synthesizing with {len(available)}/{len(advisor_clis)} "
+            f"advisors (missing: {', '.join(missing)})"
+        )
+
+    advisor_blocks = "\n\n".join(
+        f"# Advisor: {cli.title()}\n"
+        f"_Perspective: {SYNTHESIS_PERSPECTIVES.get(cli, 'general')[:100]}_\n\n"
+        f"{output[:4000]}"
+        for cli, output in available.items()
+    )
+
+    synthesis_prompt = SYNTHESIS_PROMPT_TEMPLATE.format(
+        n=len(available),
+        task=project.task,
+        advisor_blocks=advisor_blocks,
+    )
+
+    print(
+        f"[maestro] Synthesizing {len(available)} advisor outputs "
+        f"via {synthesizer.title()}..."
+    )
+    start = time.time()
+    synth_result = dispatch_agent(
+        synthesizer,
+        synthesis_prompt,
+        project.cwd,
+        timeout=timeout,
+        skip_preflight=skip_preflight,
+    )
+    synth_elapsed = round(time.time() - start, 1)
+    project.results.append(
+        asdict(
+            AgentResult(
+                task_id="synthesizer",
+                cli=synthesizer,
+                status=synth_result.status,
+                duration_s=synth_elapsed,
+                output=(synth_result.output or "")[:8000],
+            )
+        )
+    )
+    print(f"  Synthesizer completed ({synth_elapsed}s, status={synth_result.status})")
+
+    return project
+
+
 def execute_swarm(
     project: MaestroProject,
     timeout: int,
@@ -1077,6 +1317,18 @@ def generate_report(project: MaestroProject, as_json: bool = False) -> str:
             if r.get("status") == "done":
                 lines.append(f"Final answer from: {r.get('cli', '?').title()}")
                 break
+    elif project.pattern == "synthesis":
+        synth = next(
+            (r for r in project.results if r.get("task_id") == "synthesizer"),
+            None,
+        )
+        if synth and synth.get("status") == "done":
+            lines.append(
+                f"Final synthesis from: {synth.get('cli', '?').title()} "
+                "(see Consensus / Conflicts / Final Direction sections in output above)"
+            )
+        else:
+            lines.append("Synthesis pass did not complete — inspect advisor outputs manually.")
 
     return "\n".join(lines)
 
@@ -1131,12 +1383,22 @@ def cmd_run(args):
 
     # Execute pattern
     sp = getattr(args, "skip_preflight", False)
+    advisors_arg = (
+        [a.strip() for a in args.advisors.split(",") if a.strip()]
+        if getattr(args, "advisors", None)
+        else None
+    )
+    synthesizer_arg = getattr(args, "synthesizer", None) or "claude"
+
     executors = {
         "solo": execute_solo,
         "pipeline": execute_pipeline,
         "race": execute_race,
         "swarm": lambda p, t, s: execute_swarm(p, t, args.ratio, s),
         "escalation": execute_escalation,
+        "synthesis": lambda p, t, s: execute_synthesis(
+            p, t, s, advisors=advisors_arg, synthesizer=synthesizer_arg
+        ),
     }
 
     executor = executors.get(project.pattern, execute_solo)
@@ -1228,6 +1490,20 @@ def cmd_plan(args):
     elif pattern == "escalation":
         print("Escalation chain: Gemini → Codex → Claude (cheapest first)")
 
+    elif pattern == "synthesis":
+        if args.advisors:
+            advisors = [a.strip() for a in args.advisors.split(",") if a.strip()]
+        elif explicit_clis and len(explicit_clis) >= 2:
+            advisors = explicit_clis[:3]
+        else:
+            advisors = ["codex", "gemini"]
+        synthesizer = (args.synthesizer or "claude").lower()
+        # Force synthesizer distinct from advisors
+        advisors = [a for a in advisors if a != synthesizer] or ["codex", "gemini"]
+        print(f"Synthesis advisors: {', '.join(c.title() for c in advisors)}")
+        print(f"Synthesizer: {synthesizer.title()}")
+        print("Output: ONE unified answer with Consensus / Conflicts / Final Direction")
+
     if args.json:
         plan_data = asdict(analysis)
         if explicit_clis:
@@ -1285,8 +1561,19 @@ def main():
     # ── run ──
     p_run = sub.add_parser("run", help="Analyze task and execute")
     p_run.add_argument("task", nargs="+", help="Task description")
-    p_run.add_argument("--pattern", choices=["solo", "pipeline", "race", "swarm", "escalation"])
+    p_run.add_argument(
+        "--pattern",
+        choices=["solo", "pipeline", "race", "swarm", "escalation", "synthesis"],
+    )
     p_run.add_argument("--ratio", help="CLI ratio for swarm (e.g., 3:1:1)")
+    p_run.add_argument(
+        "--advisors",
+        help="Synthesis advisors as comma-separated CLI names (default: codex,gemini)",
+    )
+    p_run.add_argument(
+        "--synthesizer",
+        help="CLI to perform final synthesis pass (default: claude)",
+    )
     p_run.add_argument("--cwd", help="Working directory")
     p_run.add_argument(
         "--budget",
@@ -1306,8 +1593,16 @@ def main():
     # ── plan ──
     p_plan = sub.add_parser("plan", help="Analyze task (dry-run)")
     p_plan.add_argument("task", nargs="+", help="Task description")
-    p_plan.add_argument("--pattern", choices=["solo", "pipeline", "race", "swarm", "escalation"])
+    p_plan.add_argument(
+        "--pattern",
+        choices=["solo", "pipeline", "race", "swarm", "escalation", "synthesis"],
+    )
     p_plan.add_argument("--ratio", help="CLI ratio for swarm")
+    p_plan.add_argument(
+        "--advisors",
+        help="Synthesis advisors as comma-separated CLI names",
+    )
+    p_plan.add_argument("--synthesizer", help="CLI for final synthesis pass")
     p_plan.add_argument("--cwd", default=None, help="Project root for role-routing config lookup")
     p_plan.add_argument(
         "--budget",
