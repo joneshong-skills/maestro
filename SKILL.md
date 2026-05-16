@@ -8,6 +8,7 @@ description: >-
   "分配任務給不同模型", "多 CLI 協作",
   mentions multi-CLI orchestration, agent routing, parallel execution,
   CP-value dispatch, or multi-model workflows.
+  NOT for: tracking task state or resuming across sessions — use team-tasks.
 version: 0.3.0
 tools: Read, Bash, Edit
 argument-hint: "<task description> [--pattern solo|pipeline|race|swarm|escalation|synthesis]"

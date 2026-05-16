@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -37,6 +38,8 @@ HEADLESS = {
     "claude": str(SKILLS_DIR / "claude-code-headless" / "scripts" / "claude_headless.py"),
     "codex": str(SKILLS_DIR / "codex-cli-headless" / "scripts" / "codex_headless.py"),
     "gemini": str(SKILLS_DIR / "gemini-cli-headless" / "scripts" / "gemini_headless.py"),
+    "qwen": str(SKILLS_DIR / "qwen-code-headless" / "scripts" / "qwen_headless.py"),
+    "copilot": str(SKILLS_DIR / "copilot-cli-headless" / "scripts" / "copilot_headless.py"),
 }
 
 FOREMAN = str(SKILLS_DIR / "foreman" / "scripts" / "foreman.py")
@@ -44,17 +47,17 @@ FOREMAN = str(SKILLS_DIR / "foreman" / "scripts" / "foreman.py")
 # ── CLI Routing Table ──────────────────────────────────────────────
 
 CLI_ROUTING: dict[str, dict[str, str]] = {
-    "code_generation": {"primary": "codex", "budget": "gemini", "power": "claude"},
+    "code_generation": {"primary": "codex", "budget": "qwen", "power": "claude"},
     "code_review": {"primary": "claude", "budget": "codex", "power": "claude"},
-    "debugging": {"primary": "claude", "budget": "gemini", "power": "claude"},
-    "refactoring": {"primary": "codex", "budget": "codex", "power": "claude"},
+    "debugging": {"primary": "claude", "budget": "qwen", "power": "claude"},
+    "refactoring": {"primary": "codex", "budget": "qwen", "power": "claude"},
     "architecture": {"primary": "claude", "budget": "claude", "power": "claude"},
-    "testing": {"primary": "codex", "budget": "codex", "power": "claude"},
-    "long_doc_analysis": {"primary": "gemini", "budget": "gemini", "power": "gemini"},
-    "frontend": {"primary": "gemini", "budget": "gemini", "power": "claude"},
-    "backend": {"primary": "codex", "budget": "codex", "power": "claude"},
-    "security": {"primary": "claude", "budget": "claude", "power": "claude"},
-    "research": {"primary": "gemini", "budget": "gemini", "power": "gemini"},
+    "testing": {"primary": "codex", "budget": "qwen", "power": "claude"},
+    "long_doc_analysis": {"primary": "gemini", "budget": "qwen", "power": "gemini"},
+    "frontend": {"primary": "gemini", "budget": "qwen", "power": "claude"},
+    "backend": {"primary": "codex", "budget": "qwen", "power": "claude"},
+    "security": {"primary": "claude", "budget": "copilot", "power": "claude"},
+    "research": {"primary": "gemini", "budget": "qwen", "power": "gemini"},
 }
 
 # ── Agent Routing (foreman integration) ────────────────────────────
@@ -726,25 +729,33 @@ def build_cli_cmd(cli: str, prompt: str, cwd: str | None, background: bool) -> l
 
     cmd = [sys.executable, script]
 
+    sys.path.insert(0, str(Path.home() / "workshop" / "libs" / "cli-rosetta"))
+    from cli_rosetta import get as cli_rosetta_get
+
+    entry = cli_rosetta_get(cli)
+    h = entry.headless
+
+    # Auto-approve flag
+    if entry.auto_approve.flag:
+        cmd.extend(shlex.split(entry.auto_approve.flag))
+
+    # Prompt flag + prompt
+    if h.prompt_flag:
+        cmd.extend([h.prompt_flag, prompt])
+    else:
+        cmd.append(prompt)
+
+    # Output format (claude-specific: wrapper expects json)
+    if h.output_format_flag and cli == "claude":
+        cmd.extend([h.output_format_flag, "json"])
+
+    # Allowed tools (claude-specific: wrapper param)
     if cli == "claude":
-        cmd += [
-            "-p",
-            prompt,
-            "--output-format",
-            "json",
-            "--allowedTools",
-            "Read,Edit,Bash",
-        ]
-        if cwd:
-            cmd += ["--cwd", cwd]
-    elif cli == "codex":
-        cmd += [prompt, "--full-auto"]
-        if cwd:
-            cmd += ["--cd", cwd]
-    elif cli == "gemini":
-        cmd += ["-p", prompt, "--approval-mode", "yolo"]
-        if cwd:
-            cmd += ["--cwd", cwd]
+        cmd.extend(["--allowedTools", "Read,Edit,Bash"])
+
+    # CWD flag
+    if cwd and h.cwd_flag:
+        cmd.extend([h.cwd_flag, cwd])
 
     if background:
         cmd.append("--background")
